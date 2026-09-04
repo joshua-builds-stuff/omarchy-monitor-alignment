@@ -1,0 +1,1769 @@
+#!/usr/bin/env python3
+"""monitor-align - visual display arrangement for Hyprland / Omarchy.
+
+Drag, drop and rotate monitors on a live canvas, identify them with a
+coordinate grid drawn on the real screens, apply changes live with an
+auto-revert safety net, then save to ~/.config/hypr/monitors.lua.
+"""
+
+from __future__ import annotations
+
+import ctypes
+
+# libgtk4-layer-shell must be loaded before libwayland-client, i.e. before GTK.
+ctypes.CDLL("libgtk4-layer-shell.so.0")
+
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import unicodedata
+from dataclasses import dataclass, replace
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("PangoCairo", "1.0")
+
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango, PangoCairo
+from gi.repository import Gtk4LayerShell as LayerShell
+
+APP_ID = "org.omarchy.MonitorAlign"
+VERSION = "1.0.0"
+MONITORS_LUA = os.path.expanduser("~/.config/hypr/monitors.lua")
+THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+
+TRANSFORMS = [
+    (0, "Normal"),
+    (1, "90°"),
+    (2, "180°"),
+    (3, "270°"),
+    (4, "Flipped"),
+    (5, "Flipped 90°"),
+    (6, "Flipped 180°"),
+    (7, "Flipped 270°"),
+]
+
+SNAP_PX = 22          # widget pixels within which edges snap
+REVERT_SECONDS = 15   # auto-revert window after a live apply
+IDENTIFY_SECONDS = 8  # how long the on-screen identify overlays stay up
+
+
+# --------------------------------------------------------------------------
+# Theme
+# --------------------------------------------------------------------------
+
+FALLBACK_COLORS = {
+    "mode": "dark",
+    "accent": "#7aa2f7",
+    "background": "#1a1b26",
+    "dark_background": "#13141c",
+    "darker_background": "#0e0e14",
+    "lighter_background": "#24283b",
+    "foreground": "#a9b1d6",
+    "dark_foreground": "#565f89",
+    "bright_foreground": "#c0caf5",
+    "muted": "#414868",
+    "red": "#f7768e",
+    "green": "#9ece6a",
+    "yellow": "#e0af68",
+}
+
+
+def _rgb(value: str) -> tuple[float, float, float]:
+    value = value.lstrip("#")
+    if len(value) == 3:
+        value = "".join(c * 2 for c in value)
+    try:
+        return tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except ValueError:
+        return (0.5, 0.5, 0.5)
+
+
+class Palette:
+    """Colors pulled from the active Omarchy theme, with sane fallbacks."""
+
+    def __init__(self) -> None:
+        data = dict(FALLBACK_COLORS)
+        try:
+            with open(THEME_COLORS, "rb") as handle:
+                loaded = tomllib.load(handle)
+            data.update({k: v for k, v in loaded.items() if isinstance(v, str)})
+        except Exception:
+            pass
+
+        self.dark = str(data.get("mode", "dark")).lower() != "light"
+        for key in FALLBACK_COLORS:
+            setattr(self, key + "_hex", str(data.get(key, FALLBACK_COLORS[key])))
+            setattr(self, key, _rgb(str(data.get(key, FALLBACK_COLORS[key]))))
+
+    def css(self) -> str:
+        accent = self.accent_hex
+        fg = self.bright_foreground_hex
+        return f"""
+        @define-color accent_bg_color {accent};
+        @define-color accent_color {accent};
+        :root {{
+            --accent-bg-color: {accent};
+            --accent-color: {accent};
+        }}
+        .mon-canvas {{
+            background-color: {self.darker_background_hex};
+            border-radius: 12px;
+        }}
+        .mon-title {{ font-weight: 700; color: {fg}; }}
+        .mon-dim {{ opacity: 0.65; font-size: 0.9em; }}
+        .mono {{ font-family: monospace; }}
+        window.identify {{ background-color: transparent; }}
+        """
+
+
+# --------------------------------------------------------------------------
+# hyprctl plumbing
+# --------------------------------------------------------------------------
+
+
+def hyprctl_json(args: list[str]):
+    try:
+        out = subprocess.run(["hyprctl", "-j"] + args, capture_output=True,
+                             text=True, timeout=5)
+        return json.loads(out.stdout)
+    except Exception:
+        return []
+
+
+def hyprctl_eval(chunk: str) -> tuple[bool, str]:
+    """Run a Lua chunk inside Hyprland.
+
+    Omarchy drives Hyprland through its Lua config parser, which refuses
+    `hyprctl keyword` outright ("keyword can't work with non-legacy parsers.
+    Use eval."), so live changes have to go through `hyprctl eval`. It answers
+    a bare "ok" on success; anything else is a failure, including the refusal
+    above, which exits 0 and never says "error".
+    """
+    if not chunk.strip():
+        return True, ""
+    try:
+        out = subprocess.run(["hyprctl", "eval", chunk], capture_output=True,
+                             text=True, timeout=10)
+    except Exception as exc:
+        return False, str(exc)
+    text = (out.stdout + out.stderr).strip()
+    return out.returncode == 0 and text.lower().startswith("ok"), text
+
+
+def apply_monitors(monitors: list[Monitor]) -> tuple[bool, str]:
+    """Push the whole arrangement to Hyprland in one chunk."""
+    return hyprctl_eval("\n".join(m.lua() for m in monitors))
+
+
+def hyprctl(*args: str) -> str:
+    try:
+        out = subprocess.run(["hyprctl", *args], capture_output=True,
+                             text=True, timeout=10)
+        return (out.stdout + out.stderr).strip()
+    except Exception as exc:
+        return str(exc)
+
+
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+
+
+def lua_string(value: str) -> str:
+    """Return a Lua double-quoted string containing exactly ``value``.
+
+    Monitor metadata comes from the compositor and can ultimately reach the
+    Lua configuration evaluator.  Escape syntax characters, source line
+    separators, and control/format bytes instead of trusting that metadata to
+    already match Hyprland's connector-name grammar.
+    """
+    escaped: list[str] = []
+    for char in str(value):
+        if char == "\\":
+            escaped.append("\\\\")
+        elif char == '"':
+            escaped.append('\\"')
+        elif char == "\n":
+            escaped.append("\\n")
+        elif char == "\r":
+            escaped.append("\\r")
+        elif char == "\t":
+            escaped.append("\\t")
+        elif char in ("\u2028", "\u2029") or unicodedata.category(char).startswith("C"):
+            escaped.extend(
+                f"\\{byte:03d}" for byte in char.encode("utf-8", "surrogatepass"))
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
+@dataclass(frozen=True)
+class Mode:
+    w: int
+    h: int
+    rate: float
+
+    @property
+    def res(self) -> str:
+        return f"{self.w}x{self.h}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.w}×{self.h}"
+
+    @property
+    def rate_label(self) -> str:
+        return f"{self.rate:.2f} Hz".replace(".00 ", " ")
+
+    @property
+    def hypr(self) -> str:
+        return f"{self.w}x{self.h}@{self.rate:.2f}"
+
+
+def parse_mode(text: str) -> Mode | None:
+    # "2560x1440@143.86Hz"
+    try:
+        geom, _, rate = text.partition("@")
+        w, _, h = geom.partition("x")
+        return Mode(int(w), int(h), float(rate.rstrip("Hz")))
+    except Exception:
+        return None
+
+
+@dataclass
+class Monitor:
+    name: str
+    description: str
+    modes: list[Mode]
+    mode: Mode
+    scale: float
+    transform: int
+    x: int
+    y: int
+    enabled: bool
+    index: int = 0
+
+    def copy(self) -> "Monitor":
+        return replace(self, modes=list(self.modes))
+
+    @property
+    def rotated(self) -> bool:
+        return self.transform in (1, 3, 5, 7)
+
+    @property
+    def logical(self) -> tuple[int, int]:
+        w = int(round(self.mode.w / self.scale))
+        h = int(round(self.mode.h / self.scale))
+        return (h, w) if self.rotated else (w, h)
+
+    @property
+    def rect(self) -> tuple[int, int, int, int]:
+        w, h = self.logical
+        return (self.x, self.y, w, h)
+
+    def resolutions(self) -> list[str]:
+        seen: list[str] = []
+        for mode in self.modes:
+            if mode.res not in seen:
+                seen.append(mode.res)
+        return seen
+
+    def rates_for(self, res: str) -> list[Mode]:
+        return sorted((m for m in self.modes if m.res == res),
+                      key=lambda m: -m.rate)
+
+    def scale_ok(self) -> bool:
+        snapped = round(self.scale * 120) / 120
+        if snapped <= 0:
+            return False
+        for side in (self.mode.w, self.mode.h):
+            if abs(side / snapped - round(side / snapped)) > 1e-4:
+                return False
+        return True
+
+    def valid_scales(self) -> list[float]:
+        out = []
+        for step in range(60, 361):  # 0.50 .. 3.00 in 1/120 increments
+            s = step / 120
+            if all(abs(side / s - round(side / s)) < 1e-4
+                   for side in (self.mode.w, self.mode.h)):
+                out.append(round(s, 4))
+        return out
+
+    def nearest_scale(self) -> float:
+        options = self.valid_scales()
+        if not options:
+            return 1.0
+        return min(options, key=lambda s: abs(s - self.scale))
+
+    def lua(self) -> str:
+        if not self.enabled:
+            return f"hl.monitor({{ output = {lua_string(self.name)}, disabled = true }})"
+        return (f"hl.monitor({{ output = {lua_string(self.name)}, "
+                f'mode = "{self.mode.hypr}", '
+                f'position = "{self.x}x{self.y}", '
+                f'scale = {self.scale:g}, '
+                f'transform = {self.transform} }})')
+
+
+def pick_mode(modes: list[Mode], w: int, h: int, rate: float) -> Mode:
+    candidates = [m for m in modes if m.w == w and m.h == h]
+    if not candidates:
+        candidates = [m for m in modes if m.w == h and m.h == w]
+    if not candidates:
+        return Mode(max(w, 1), max(h, 1), rate or 60.0)
+    return min(candidates, key=lambda m: abs(m.rate - rate))
+
+
+def load_monitors() -> list[Monitor]:
+    monitors: list[Monitor] = []
+    for entry in hyprctl_json(["monitors", "all"]):
+        modes = [m for m in (parse_mode(s) for s in entry.get("availableModes", [])) if m]
+        modes.sort(key=lambda m: (-m.w * m.h, -m.rate))
+        width = int(entry.get("width") or 0)
+        height = int(entry.get("height") or 0)
+        rate = float(entry.get("refreshRate") or 60.0)
+        if width and height:
+            mode = pick_mode(modes, width, height, rate)
+        elif modes:
+            mode = modes[0]
+        else:
+            mode = Mode(1920, 1080, 60.0)
+        if not modes:
+            modes = [mode]
+        scale = float(entry.get("scale") or 1.0)
+        monitors.append(Monitor(
+            name=entry.get("name", "?"),
+            description=entry.get("description", ""),
+            modes=modes,
+            mode=mode,
+            scale=scale if scale > 0 else 1.0,
+            transform=int(entry.get("transform") or 0),
+            x=int(entry.get("x") or 0),
+            y=int(entry.get("y") or 0),
+            enabled=not entry.get("disabled", False),
+        ))
+    # Number them left to right, top to bottom, so the badges the identify
+    # overlay paints on the real screens read 1, 2, 3 across the desk.
+    monitors.sort(key=lambda m: (m.x, m.y, m.name))
+    for i, mon in enumerate(monitors, start=1):
+        mon.index = i
+    return monitors
+
+
+# --------------------------------------------------------------------------
+# Layout engine
+# --------------------------------------------------------------------------
+
+AXES = {"row": "h", "column": "v"}
+ALIGN_LABELS = {
+    "row": ["Top edges", "Centers", "Bottom edges"],
+    "column": ["Left edges", "Centers", "Right edges"],
+}
+ALIGN_KEYS = ["start", "center", "end"]
+
+
+def active_of(monitors: list[Monitor]) -> list[Monitor]:
+    return [m for m in monitors if m.enabled]
+
+
+def normalize(monitors: list[Monitor]) -> None:
+    """Shift the desktop so its top-left corner sits at 0x0."""
+    active = active_of(monitors)
+    if not active:
+        return
+    dx = min(m.x for m in active)
+    dy = min(m.y for m in active)
+    for mon in active:
+        mon.x -= dx
+        mon.y -= dy
+
+
+def order_along(monitors: list[Monitor], axis: str) -> list[Monitor]:
+    """Enabled monitors in their current visual order along an axis."""
+    active = active_of(monitors)
+    if axis == "h":
+        return sorted(active, key=lambda m: (m.x, m.y, m.name))
+    return sorted(active, key=lambda m: (m.y, m.x, m.name))
+
+
+def lay_out(ordered: list[Monitor], axis: str, align: str) -> None:
+    """Pack monitors edge to edge along `axis`, aligned on the cross axis."""
+    if not ordered:
+        return
+    cross = max((m.logical[1] if axis == "h" else m.logical[0]) for m in ordered)
+    cursor = 0
+    for mon in ordered:
+        w, h = mon.logical
+        if axis == "h":
+            mon.x = cursor
+            cursor += w
+            slack = cross - h
+        else:
+            mon.y = cursor
+            cursor += h
+            slack = cross - w
+        offset = 0 if align == "start" else (slack // 2 if align == "center" else slack)
+        if axis == "h":
+            mon.y = offset
+        else:
+            mon.x = offset
+
+
+def overlapping(monitors: list[Monitor]) -> list[tuple[str, str]]:
+    hits = []
+    active = active_of(monitors)
+    for i, a in enumerate(active):
+        ax, ay, aw, ah = a.rect
+        for b in active[i + 1:]:
+            bx, by, bw, bh = b.rect
+            if ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah:
+                hits.append((a.name, b.name))
+    return hits
+
+
+def disconnected(monitors: list[Monitor]) -> list[str]:
+    """Monitors that share no edge with any other monitor."""
+    active = active_of(monitors)
+    if len(active) < 2:
+        return []
+    loose = []
+    for a in active:
+        ax, ay, aw, ah = a.rect
+        touches = False
+        for b in active:
+            if b is a:
+                continue
+            bx, by, bw, bh = b.rect
+            h_touch = (ax + aw == bx or bx + bw == ax) and ay < by + bh and by < ay + ah
+            v_touch = (ay + ah == by or by + bh == ay) and ax < bx + bw and bx < ax + aw
+            if h_touch or v_touch:
+                touches = True
+                break
+        if not touches:
+            loose.append(a.name)
+    return loose
+
+
+# --------------------------------------------------------------------------
+# Cairo helpers
+# --------------------------------------------------------------------------
+
+
+def rounded_rect(cr, x, y, w, h, r) -> None:
+    r = max(0.0, min(r, w / 2, h / 2))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def text_at(cr, text, x, y, size, rgb, alpha=1.0, bold=False,
+            anchor="c", mono=False):
+    layout = PangoCairo.create_layout(cr)
+    family = "Monospace" if mono else "Sans"
+    weight = "Bold " if bold else ""
+    layout.set_font_description(
+        Pango.FontDescription.from_string(f"{family} {weight}{size}"))
+    layout.set_text(text, -1)
+    tw, th = layout.get_pixel_size()
+    if anchor in ("c", "n", "s"):
+        tx = x - tw / 2
+    elif anchor in ("e", "ne", "se"):
+        tx = x - tw
+    else:
+        tx = x
+    if anchor in ("c", "e", "w"):
+        ty = y - th / 2
+    elif anchor in ("s", "se", "sw"):
+        ty = y - th
+    else:
+        ty = y
+    cr.set_source_rgba(*rgb, alpha)
+    cr.move_to(tx, ty)
+    PangoCairo.show_layout(cr, layout)
+    return tw, th
+
+
+def chip(cr, text, x, y, size, fg, bg, anchor="c", mono=False, pad=6):
+    """Text on a rounded plate, so labels stay readable over any wallpaper."""
+    layout = PangoCairo.create_layout(cr)
+    family = "Monospace" if mono else "Sans"
+    layout.set_font_description(
+        Pango.FontDescription.from_string(f"{family} Bold {size}"))
+    layout.set_text(text, -1)
+    tw, th = layout.get_pixel_size()
+    bw, bh = tw + pad * 2, th + pad
+    bx = x - bw / 2 if anchor in ("c", "n", "s") else (x - bw if anchor in ("e", "ne", "se") else x)
+    by = y - bh / 2 if anchor in ("c", "e", "w") else (y - bh if anchor in ("s", "se", "sw") else y)
+    cr.set_source_rgba(*bg, 0.82)
+    rounded_rect(cr, bx, by, bw, bh, 5)
+    cr.fill()
+    cr.set_source_rgba(*fg, 1.0)
+    cr.move_to(bx + pad, by + bh / 2 - th / 2)
+    PangoCairo.show_layout(cr, layout)
+    return bw, bh
+
+
+# --------------------------------------------------------------------------
+# Identify overlays - full-screen alignment grid on every physical display
+# --------------------------------------------------------------------------
+
+
+def desktop_grid(monitors: list[Monitor]) -> tuple[int, int]:
+    """One (minor, major) grid spacing shared by every screen.
+
+    The grid is drawn in global desktop coordinates, so it only proves
+    alignment if all displays use the same step - a line at y=500 has to
+    exist on both sides of a bezel to be worth comparing. The step is sized
+    off the smallest edge in the setup so the densest screen stays readable.
+    """
+    sides = [side for mon in active_of(monitors) for side in mon.logical]
+    if not sides:
+        return 100, 500
+    smallest = min(sides)
+    for minor, major in ((25, 100), (50, 250), (100, 500), (200, 1000)):
+        if smallest / minor <= 16:
+            return minor, major
+    return 250, 1000
+
+
+class IdentifyOverlay:
+    """Layer-shell windows drawing a coordinate grid on each real screen.
+
+    The overlays stay up for as long as the Identify toggle is on and redraw
+    from the *pending* arrangement, so dragging a display in the window moves
+    its grid on the glass. That is the point of the thing: you line the major
+    lines up across the bezel, and the offset is right.
+    """
+
+    def __init__(self, palette: Palette, on_hidden=None) -> None:
+        self.palette = palette
+        self.on_hidden = on_hidden
+        self.windows: list[Gtk.Window] = []
+        self.areas: list[tuple[Gtk.DrawingArea, str]] = []
+        self.timeout: int | None = None
+        self.pending = False
+
+    @property
+    def visible(self) -> bool:
+        return bool(self.windows)
+
+    def hide(self, notify: bool = True) -> None:
+        had = bool(self.windows)
+        if self.timeout:
+            GLib.source_remove(self.timeout)
+            self.timeout = None
+        for win in self.windows:
+            win.destroy()
+        self.windows = []
+        self.areas = []
+        if had and notify and self.on_hidden is not None:
+            self.on_hidden()
+
+    def show(self, monitors: list[Monitor], seconds: int = 0) -> None:
+        """Put a grid on every screen. seconds <= 0 keeps them up."""
+        self.hide(notify=False)
+        by_name = {m.name: m for m in monitors}
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        gdk_monitors = display.get_monitors()
+        for i in range(gdk_monitors.get_n_items()):
+            gdk_mon = gdk_monitors.get_item(i)
+            name = gdk_mon.get_connector() or ""
+            mon = by_name.get(name)
+            if mon is None or not mon.enabled:
+                continue
+            self.windows.append(self._make_window(gdk_mon, mon, monitors))
+        if self.windows and seconds > 0:
+            self.timeout = GLib.timeout_add_seconds(seconds, self._expire)
+
+    def refresh(self) -> None:
+        """Repaint from whatever the Monitor objects now say."""
+        for area, _ in self.areas:
+            area.queue_draw()
+        for win in self.windows:
+            self._click_through(win)
+
+    def rebind(self, monitors: list[Monitor]) -> None:
+        """Point the overlays at a fresh set of Monitor objects, then repaint."""
+        by_name = {m.name: m for m in monitors}
+        if any(name not in by_name or not by_name[name].enabled
+               for _, name in self.areas):
+            self.show(monitors)
+            return
+        for area, name in self.areas:
+            area.set_draw_func(self._draw, (by_name[name], monitors))
+        self.refresh()
+
+    def _expire(self) -> bool:
+        self.timeout = None
+        self.hide()
+        return GLib.SOURCE_REMOVE
+
+    def _make_window(self, gdk_mon, mon: Monitor, all_mons: list[Monitor]) -> Gtk.Window:
+        win = Gtk.Window()
+        win.add_css_class("identify")
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_monitor(win, gdk_mon)
+        LayerShell.set_namespace(win, "monitor-align-identify")
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM,
+                     LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(win, edge, True)
+        LayerShell.set_exclusive_zone(win, -1)
+
+        area = Gtk.DrawingArea()
+        area.set_draw_func(self._draw, (mon, all_mons))
+        win.set_child(area)
+        self.areas.append((area, mon.name))
+
+        # Escape hatch: the overlays are meant to be click-through, but if the
+        # compositor does route a click here, dismiss rather than trap the user
+        # under a full-screen surface they cannot get out of.
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_: self.hide())
+        area.add_controller(click)
+
+        win.connect("map", self._click_through)
+        win.present()
+        return win
+
+    def _click_through(self, win: Gtk.Window) -> None:
+        """Pass pointer events through to whatever is underneath.
+
+        Re-applied on every refresh: GTK resets the input region when the
+        surface is reconfigured, and a persistent overlay that swallows clicks
+        would make the window behind it undraggable.
+        """
+        def apply() -> bool:
+            try:
+                surface = win.get_surface()
+                if surface is not None:
+                    surface.set_input_region(cairo.Region())
+            except Exception:
+                pass
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(apply)
+
+    def _draw(self, area, cr, width, height, data) -> None:
+        mon, all_mons = data
+        pal = self.palette
+        lw, lh = mon.logical
+        # Widget pixels -> logical desktop pixels (1:1 unless GTK scales us).
+        sx = lw / width if width else 1.0
+        sy = lh / height if height else 1.0
+        ox, oy = mon.x, mon.y
+
+        def px(gx: float) -> float:
+            return (gx - ox) / sx
+
+        def py(gy: float) -> float:
+            return (gy - oy) / sy
+
+        # Dim backdrop so the grid reads over any wallpaper.
+        cr.set_source_rgba(*pal.darker_background, 0.62)
+        cr.paint()
+
+        minor, major = desktop_grid(all_mons)
+
+        def lines(step, start, span):
+            first = math.ceil(start / step) * step
+            value = first
+            while value <= start + span:
+                yield value
+                value += step
+
+        # Minor grid.
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(*pal.accent, 0.16)
+        for gx in lines(minor, ox, lw):
+            cr.move_to(round(px(gx)) + 0.5, 0)
+            cr.line_to(round(px(gx)) + 0.5, height)
+        for gy in lines(minor, oy, lh):
+            cr.move_to(0, round(py(gy)) + 0.5)
+            cr.line_to(width, round(py(gy)) + 0.5)
+        cr.stroke()
+
+        # Major grid, labelled with global desktop coordinates. Two monitors
+        # are aligned when their major lines meet across the bezel.
+        cr.set_line_width(1.5)
+        cr.set_source_rgba(*pal.accent, 0.45)
+        for gx in lines(major, ox, lw):
+            cr.move_to(round(px(gx)) + 0.5, 0)
+            cr.line_to(round(px(gx)) + 0.5, height)
+        for gy in lines(major, oy, lh):
+            cr.move_to(0, round(py(gy)) + 0.5)
+            cr.line_to(width, round(py(gy)) + 0.5)
+        cr.stroke()
+
+        for gx in lines(major, ox, lw):
+            if px(gx) < 34 or px(gx) > width - 34:
+                continue
+            text_at(cr, str(gx), px(gx) + 5, 6, 9, pal.accent, 0.8,
+                    anchor="nw", mono=True)
+        for gy in lines(major, oy, lh):
+            if py(gy) < 20 or py(gy) > height - 20:
+                continue
+            text_at(cr, str(gy), 6, py(gy) + 4, 9, pal.accent, 0.8,
+                    anchor="nw", mono=True)
+
+        # Screen edge, centre crosshair.
+        cr.set_line_width(4.0)
+        cr.set_source_rgba(*pal.accent, 0.9)
+        cr.rectangle(2, 2, width - 4, height - 4)
+        cr.stroke()
+
+        cx, cy = width / 2, height / 2
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(*pal.accent, 0.55)
+        cr.move_to(cx + 0.5, 0); cr.line_to(cx + 0.5, height)
+        cr.move_to(0, cy + 0.5); cr.line_to(width, cy + 0.5)
+        cr.stroke()
+
+        # Identity plate.
+        badge = min(width, height) * 0.22
+        cr.set_source_rgba(*pal.accent, 0.92)
+        cr.arc(cx, cy - badge * 0.15, badge / 2, 0, 2 * math.pi)
+        cr.fill()
+        number_color = pal.darker_background if pal.dark else pal.background
+        text_at(cr, str(mon.index), cx, cy - badge * 0.15, int(badge * 0.5),
+                number_color, 1.0, bold=True)
+
+        below = cy + badge * 0.5
+        text_at(cr, mon.name, cx, below, 26, pal.bright_foreground, 1.0, bold=True,
+                anchor="n")
+        detail = (f"{mon.mode.label} @ {mon.mode.rate:.2f} Hz   ·   "
+                  f"scale {mon.scale:g}   ·   {TRANSFORMS[mon.transform][1]}")
+        text_at(cr, detail, cx, below + 38, 12, pal.foreground, 0.95, anchor="n")
+        text_at(cr, mon.description, cx, below + 60, 10, pal.foreground,
+                0.75, anchor="n")
+        text_at(cr, f"origin {mon.x},{mon.y}   size {lw}×{lh}",
+                cx, below + 80, 11, pal.accent, 0.95, anchor="n", mono=True)
+
+        # While the arrangement is unapplied the grid shows where this screen
+        # *would* sit, over a panel the compositor has not moved yet. Say so.
+        if self.pending:
+            chip(cr, "PREVIEW — press “Try it” to move the screens",
+                 cx, 42, 12, pal.darker_background, pal.accent, anchor="n")
+
+        # Corner coordinates - the numbers to compare between two screens.
+        fg = pal.bright_foreground
+        bg = pal.darker_background
+        chip(cr, f"{ox},{oy}", 14, 14, 10, fg, bg, anchor="nw", mono=True)
+        chip(cr, f"{ox + lw},{oy}", width - 14, 14, 10, fg, bg, anchor="ne", mono=True)
+        chip(cr, f"{ox},{oy + lh}", 14, height - 14, 10, fg, bg, anchor="sw", mono=True)
+        chip(cr, f"{ox + lw},{oy + lh}", width - 14, height - 14, 10, fg, bg,
+             anchor="se", mono=True)
+
+        # Neighbour hints on the edges that actually touch another screen.
+        for other in active_of(all_mons):
+            if other is mon or other.name == mon.name:
+                continue
+            oxx, oyy, oww, ohh = other.rect
+            if oxx + oww == ox and oyy < oy + lh and oy < oyy + ohh:
+                y0 = max(oy, oyy); y1 = min(oy + lh, oyy + ohh)
+                cr.set_source_rgba(*pal.green, 0.85)
+                cr.set_line_width(6)
+                cr.move_to(3, py(y0)); cr.line_to(3, py(y1)); cr.stroke()
+                chip(cr, f"◀ {other.index} {other.name}", 16, py((y0 + y1) / 2),
+                     11, fg, bg, anchor="w")
+            if ox + lw == oxx and oyy < oy + lh and oy < oyy + ohh:
+                y0 = max(oy, oyy); y1 = min(oy + lh, oyy + ohh)
+                cr.set_source_rgba(*pal.green, 0.85)
+                cr.set_line_width(6)
+                cr.move_to(width - 3, py(y0)); cr.line_to(width - 3, py(y1)); cr.stroke()
+                chip(cr, f"{other.name} {other.index} ▶", width - 16,
+                     py((y0 + y1) / 2), 11, fg, bg, anchor="e")
+            if oyy + ohh == oy and oxx < ox + lw and ox < oxx + oww:
+                x0 = max(ox, oxx); x1 = min(ox + lw, oxx + oww)
+                cr.set_source_rgba(*pal.green, 0.85)
+                cr.set_line_width(6)
+                cr.move_to(px(x0), 3); cr.line_to(px(x1), 3); cr.stroke()
+                chip(cr, f"▲ {other.index} {other.name}", px((x0 + x1) / 2), 16,
+                     11, fg, bg, anchor="n")
+            if oy + lh == oyy and oxx < ox + lw and ox < oxx + oww:
+                x0 = max(ox, oxx); x1 = min(ox + lw, oxx + oww)
+                cr.set_source_rgba(*pal.green, 0.85)
+                cr.set_line_width(6)
+                cr.move_to(px(x0), height - 3); cr.line_to(px(x1), height - 3); cr.stroke()
+                chip(cr, f"▼ {other.index} {other.name}", px((x0 + x1) / 2),
+                     height - 16, 11, fg, bg, anchor="s")
+
+
+# --------------------------------------------------------------------------
+# Arrangement canvas
+# --------------------------------------------------------------------------
+
+
+class Canvas(Gtk.DrawingArea):
+    """Scaled top-down view of the desktop; monitors are draggable tiles."""
+
+    def __init__(self, app: "MonitorAlign") -> None:
+        super().__init__()
+        self.app = app
+        self.pal = app.pal
+        self.zoom = 1.0
+        self.offset = (0.0, 0.0)
+        self.drag_target: Monitor | None = None
+        self.drag_origin = (0, 0)
+        self.guides: list[tuple[str, float]] = []
+
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_size_request(520, 340)
+        self.add_css_class("mon-canvas")
+        self.set_draw_func(self._draw)
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._drag_begin)
+        drag.connect("drag-update", self._drag_update)
+        drag.connect("drag-end", self._drag_end)
+        self.add_controller(drag)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._motion)
+        self.add_controller(motion)
+
+    # -- projection ------------------------------------------------------
+
+    def _fit(self, width: int, height: int) -> None:
+        mons = self.app.monitors
+        if not mons:
+            self.zoom, self.offset = 1.0, (0.0, 0.0)
+            return
+        pad = 36
+        xs0 = min(m.x for m in mons)
+        ys0 = min(m.y for m in mons)
+        xs1 = max(m.x + m.logical[0] for m in mons)
+        ys1 = max(m.y + m.logical[1] for m in mons)
+        span_w = max(xs1 - xs0, 1)
+        span_h = max(ys1 - ys0, 1)
+        self.zoom = min((width - pad * 2) / span_w, (height - pad * 2) / span_h)
+        self.offset = (
+            (width - span_w * self.zoom) / 2 - xs0 * self.zoom,
+            (height - span_h * self.zoom) / 2 - ys0 * self.zoom,
+        )
+
+    def to_widget(self, x: float, y: float) -> tuple[float, float]:
+        return (x * self.zoom + self.offset[0], y * self.zoom + self.offset[1])
+
+    def to_desktop(self, x: float, y: float) -> tuple[float, float]:
+        return ((x - self.offset[0]) / self.zoom, (y - self.offset[1]) / self.zoom)
+
+    def monitor_at(self, wx: float, wy: float) -> Monitor | None:
+        dx, dy = self.to_desktop(wx, wy)
+        for mon in reversed(self.app.monitors):
+            mx, my, mw, mh = mon.rect
+            if mx <= dx <= mx + mw and my <= dy <= my + mh:
+                return mon
+        return None
+
+    # -- interaction -----------------------------------------------------
+
+    def _motion(self, _c, x, y) -> None:
+        hit = self.monitor_at(x, y)
+        self.set_cursor(Gdk.Cursor.new_from_name("grab" if hit else "default", None))
+
+    def _drag_begin(self, _g, x, y) -> None:
+        mon = self.monitor_at(x, y)
+        self.drag_target = mon
+        if mon is None:
+            return
+        self.drag_origin = (mon.x, mon.y)
+        self.app.select(mon)
+        self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+
+    def _drag_update(self, _g, dx, dy) -> None:
+        mon = self.drag_target
+        if mon is None:
+            return
+        nx = self.drag_origin[0] + dx / self.zoom
+        ny = self.drag_origin[1] + dy / self.zoom
+        mon.x, mon.y, self.guides = self._snap(mon, nx, ny)
+        self.app.on_geometry_changed(redraw_only=True)
+
+    def _drag_end(self, _g, dx, dy) -> None:
+        if self.drag_target is None:
+            return
+        self.drag_target = None
+        self.guides = []
+        normalize(self.app.monitors)
+        self.set_cursor(Gdk.Cursor.new_from_name("grab", None))
+        self.app.on_geometry_changed()
+
+    def _snap(self, mon: Monitor, nx: float, ny: float):
+        """Pull edges and centres onto neighbouring monitors' edges."""
+        tol = SNAP_PX / max(self.zoom, 1e-6)
+        w, h = mon.logical
+        others = [m for m in self.app.monitors if m is not mon and m.enabled]
+
+        best_dx = best_dy = None
+        guides: list[tuple[str, float]] = []
+
+        cand_x = [0.0]
+        cand_y = [0.0]
+        for other in others:
+            ox, oy, ow, oh = other.rect
+            cand_x += [ox, ox + ow, ox + ow / 2]
+            cand_y += [oy, oy + oh, oy + oh / 2]
+
+        for mine in (nx, nx + w, nx + w / 2):
+            for target in cand_x:
+                delta = target - mine
+                if abs(delta) <= tol and (best_dx is None or abs(delta) < abs(best_dx)):
+                    best_dx = delta
+        for mine in (ny, ny + h, ny + h / 2):
+            for target in cand_y:
+                delta = target - mine
+                if abs(delta) <= tol and (best_dy is None or abs(delta) < abs(best_dy)):
+                    best_dy = delta
+
+        fx = nx + (best_dx or 0.0)
+        fy = ny + (best_dy or 0.0)
+        if best_dx is not None:
+            for edge in (fx, fx + w, fx + w / 2):
+                if any(abs(edge - c) < 0.5 for c in cand_x):
+                    guides.append(("v", edge))
+        if best_dy is not None:
+            for edge in (fy, fy + h, fy + h / 2):
+                if any(abs(edge - c) < 0.5 for c in cand_y):
+                    guides.append(("h", edge))
+        return int(round(fx)), int(round(fy)), guides
+
+    # -- painting --------------------------------------------------------
+
+    def _draw(self, _area, cr, width, height) -> None:
+        pal = self.pal
+        self._fit(width, height)
+
+        cr.set_source_rgba(*pal.darker_background, 1.0)
+        cr.paint()
+
+        # Faint backdrop grid, one line per 500 desktop px.
+        step = 500
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(*pal.muted, 0.25)
+        left, top = self.to_desktop(0, 0)
+        right, bottom = self.to_desktop(width, height)
+        gx = math.floor(left / step) * step
+        while gx <= right:
+            wx = round(self.to_widget(gx, 0)[0]) + 0.5
+            cr.move_to(wx, 0); cr.line_to(wx, height)
+            gx += step
+        gy = math.floor(top / step) * step
+        while gy <= bottom:
+            wy = round(self.to_widget(0, gy)[1]) + 0.5
+            cr.move_to(0, wy); cr.line_to(width, wy)
+            gy += step
+        cr.stroke()
+
+        for mon in self.app.monitors:
+            self._draw_monitor(cr, mon)
+
+        # Snap guides on top.
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(*pal.yellow, 0.9)
+        cr.set_dash([4.0, 4.0])
+        for kind, value in self.guides:
+            if kind == "v":
+                wx = round(self.to_widget(value, 0)[0]) + 0.5
+                cr.move_to(wx, 0); cr.line_to(wx, height)
+            else:
+                wy = round(self.to_widget(0, value)[1]) + 0.5
+                cr.move_to(0, wy); cr.line_to(width, wy)
+        cr.stroke()
+        cr.set_dash([])
+
+    def _draw_monitor(self, cr, mon: Monitor) -> None:
+        pal = self.pal
+        mx, my, mw, mh = mon.rect
+        x, y = self.to_widget(mx, my)
+        w, h = mw * self.zoom, mh * self.zoom
+        selected = mon is self.app.selected
+        inset = 3
+        x, y, w, h = x + inset, y + inset, max(w - inset * 2, 8), max(h - inset * 2, 8)
+
+        if not mon.enabled:
+            cr.set_source_rgba(*pal.dark_background, 0.75)
+            rounded_rect(cr, x, y, w, h, 8)
+            cr.fill_preserve()
+            cr.set_source_rgba(*pal.muted, 0.9)
+            cr.set_line_width(2)
+            cr.set_dash([6.0, 5.0])
+            cr.stroke()
+            cr.set_dash([])
+            text_at(cr, mon.name, x + w / 2, y + h / 2 - 8, 11,
+                    pal.dark_foreground, 1.0, bold=True)
+            text_at(cr, "off", x + w / 2, y + h / 2 + 10, 10, pal.dark_foreground, 1.0)
+            return
+
+        cr.set_source_rgba(*pal.lighter_background, 1.0)
+        rounded_rect(cr, x, y, w, h, 8)
+        cr.fill_preserve()
+        cr.set_source_rgba(*(pal.accent if selected else pal.muted),
+                           1.0 if selected else 0.9)
+        cr.set_line_width(3 if selected else 1.5)
+        cr.stroke()
+
+        # Bezel-ish inner frame so portrait vs landscape reads at a glance.
+        cr.set_source_rgba(*pal.darker_background, 0.55)
+        rounded_rect(cr, x + 6, y + 6, max(w - 12, 4), max(h - 12, 4), 4)
+        cr.fill()
+
+        cx, cy = x + w / 2, y + h / 2
+        badge = min(28.0, max(16.0, min(w, h) * 0.28))
+        cr.set_source_rgba(*pal.accent, 1.0 if selected else 0.7)
+        cr.arc(cx, cy - badge * 0.9, badge / 2, 0, 2 * math.pi)
+        cr.fill()
+        text_at(cr, str(mon.index), cx, cy - badge * 0.9, int(badge * 0.5),
+                pal.darker_background if pal.dark else pal.background, 1.0, bold=True)
+
+        if h > 64:
+            text_at(cr, mon.name, cx, cy + 4, 11, pal.bright_foreground, 1.0, bold=True)
+        if h > 88:
+            lw_, lh_ = mon.logical
+            text_at(cr, f"{lw_}×{lh_}", cx, cy + 22, 9, pal.foreground, 0.85, mono=True)
+        if h > 110 and mon.transform:
+            text_at(cr, TRANSFORMS[mon.transform][1], cx, cy + 38, 9, pal.yellow, 0.95)
+        if h > 128:
+            text_at(cr, f"{mx},{my}", cx, cy + 54, 8, pal.dark_foreground, 1.0, mono=True)
+
+
+# --------------------------------------------------------------------------
+# Writing monitors.lua
+# --------------------------------------------------------------------------
+
+BLOCK_BEGIN = "-- >>> monitor-align: generated block, edits here are overwritten"
+BLOCK_END = "-- <<< monitor-align"
+
+
+def lua_comment_text(value: str, limit: int = 512) -> str:
+    """Make external text inert and single-line inside a generated Lua comment."""
+    cleaned = []
+    for char in str(value):
+        if char in ("\r", "\n", "\u2028", "\u2029") or unicodedata.category(char).startswith("C"):
+            cleaned.append(" ")
+        else:
+            cleaned.append(char)
+    text = "".join(cleaned).replace(BLOCK_BEGIN, "[generated block begin]")
+    text = text.replace(BLOCK_END, "[generated block end]")
+    return text[:limit]
+
+
+def render_block(monitors: list[Monitor]) -> str:
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    lines = [BLOCK_BEGIN, f"-- written {stamp}"]
+    for mon in monitors:
+        lines.append(f"-- {mon.index}. {lua_comment_text(mon.description)}")
+        lines.append(mon.lua())
+    lines.append(BLOCK_END)
+    return "\n".join(lines)
+
+
+def save_lua(monitors: list[Monitor]) -> tuple[bool, str]:
+    try:
+        with open(MONITORS_LUA, "r") as handle:
+            original = handle.read()
+    except FileNotFoundError:
+        original = ""
+    except OSError as exc:
+        return False, str(exc)
+
+    if BLOCK_BEGIN in original and BLOCK_END in original:
+        head, _, rest = original.partition(BLOCK_BEGIN)
+        _, _, tail = rest.partition(BLOCK_END)
+        original = head.rstrip("\n") + "\n" + tail.lstrip("\n")
+
+    body = original.rstrip("\n")
+    new = (body + "\n\n" if body else "") + render_block(monitors) + "\n"
+
+    backup = ""
+    try:
+        if os.path.exists(MONITORS_LUA):
+            backup = f"{MONITORS_LUA}.bak.{int(time.time())}"
+            shutil.copy2(MONITORS_LUA, backup)
+        os.makedirs(os.path.dirname(MONITORS_LUA), exist_ok=True)
+        with open(MONITORS_LUA, "w") as handle:
+            handle.write(new)
+    except OSError as exc:
+        return False, str(exc)
+
+    hyprctl("reload")
+    # The stock catch-all rule uses position = "auto", so a reload can shuffle
+    # the desk before our block is honoured. Re-assert the explicit geometry.
+    apply_monitors(monitors)
+    errors = hyprctl("configerrors")
+    if errors and "no errors" not in errors.lower():
+        return False, errors.splitlines()[0][:160]
+    note = f" (backup: {os.path.basename(backup)})" if backup else ""
+    return True, f"Saved to monitors.lua{note}"
+
+
+# --------------------------------------------------------------------------
+# Main window
+# --------------------------------------------------------------------------
+
+ORIENTATIONS = [
+    (0, "Landscape"),
+    (1, "Portrait — rotated 90°"),
+    (3, "Portrait — rotated 270°"),
+    (2, "Landscape — upside down"),
+    (4, "Landscape — mirrored"),
+    (5, "Portrait — 90° mirrored"),
+    (7, "Portrait — 270° mirrored"),
+    (6, "Landscape — 180° mirrored"),
+]
+ORIENTATION_VALUES = [t for t, _ in ORIENTATIONS]
+
+COMMON_SCALES = [1.0, 1.25, 1.3333, 1.5, 1.6, 1.75, 2.0, 2.25, 2.5, 3.0]
+
+
+def scale_options(mon: Monitor) -> list[float]:
+    valid = mon.valid_scales()
+    opts: list[float] = []
+    for want in COMMON_SCALES:
+        if not valid:
+            break
+        near = min(valid, key=lambda v: abs(v - want))
+        if abs(near - want) < 0.01:
+            opts.append(near)
+    if not any(abs(mon.scale - o) < 1e-3 for o in opts):
+        opts.append(round(mon.scale, 4))
+    return sorted(set(opts))
+
+
+class MonitorAlign(Adw.ApplicationWindow):
+
+    def __init__(self, app: Adw.Application) -> None:
+        super().__init__(application=app, title="Monitor Align")
+        self.set_default_size(1080, 700)
+
+        self.pal = Palette()
+        self.monitors: list[Monitor] = []
+        self.selected: Monitor | None = None
+        self.baseline: list[str] = []   # revert target for "Try it"
+        self.applied: list[str] = []    # what the compositor is showing now
+        self.identify = IdentifyOverlay(self.pal, on_hidden=self._identify_hidden)
+        self._loading = False
+
+        provider = Gtk.CssProvider()
+        provider.load_from_string(self.pal.css())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self._build()
+        self.reload(reset_baseline=True)
+        self.connect("close-request", self._on_close)
+
+    # -- construction ----------------------------------------------------
+
+    def _build(self) -> None:
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+
+        self.identify_button = Gtk.ToggleButton()
+        self.identify_button.set_child(
+            Adw.ButtonContent(icon_name="video-display-symbolic", label="Identify"))
+        self.identify_button.set_tooltip_text(
+            "Show a numbered alignment grid on every screen")
+        self.identify_button.connect("toggled", self._on_identify)
+        header.pack_start(self.identify_button)
+
+        reset = Gtk.Button(icon_name="view-refresh-symbolic")
+        reset.set_tooltip_text("Reload the live configuration, discarding changes")
+        reset.connect("clicked", lambda *_: self.reload())
+        header.pack_start(reset)
+
+        save = Gtk.Button()
+        save.set_child(Adw.ButtonContent(icon_name="document-save-symbolic",
+                                         label="Save"))
+        save.set_tooltip_text("Apply and write to ~/.config/hypr/monitors.lua")
+        save.add_css_class("suggested-action")
+        save.connect("clicked", self._on_save)
+        header.pack_end(save)
+
+        apply_btn = Gtk.Button(label="Try it")
+        apply_btn.set_tooltip_text("Apply live with a 15 second auto-revert")
+        apply_btn.connect("clicked", self._on_apply)
+        header.pack_end(apply_btn)
+
+        view.add_top_bar(header)
+
+        self.banner = Adw.Banner()
+        self.banner.set_revealed(False)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        left.set_margin_top(12)
+        left.set_margin_bottom(12)
+        left.set_margin_start(12)
+        left.set_margin_end(6)
+        left.set_hexpand(True)
+
+        self.canvas = Canvas(self)
+        left.append(self.canvas)
+
+        hint = Gtk.Label(
+            label="Drag a display to move it — edges and centres snap to its "
+                  "neighbours. Turn on Identify and the grid on each screen "
+                  "follows the drag.")
+        hint.add_css_class("dim-label")
+        hint.set_wrap(True)
+        left.append(hint)
+
+        body.append(left)
+
+        sidebar = Gtk.ScrolledWindow()
+        sidebar.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sidebar.set_size_request(360, -1)
+        sidebar.set_child(self._build_sidebar())
+        body.append(sidebar)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.append(self.banner)
+        outer.append(body)
+        view.set_content(outer)
+
+        self.toasts = Adw.ToastOverlay()
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+    def _build_sidebar(self) -> Gtk.Widget:
+        page = Adw.PreferencesPage()
+        page.set_hexpand(False)
+
+        # --- Arrangement -------------------------------------------------
+        arrange = Adw.PreferencesGroup(
+            title="Arrangement",
+            description="Lay every enabled display out edge to edge.")
+
+        self.layout_row = Adw.ComboRow(title="Direction")
+        self.layout_row.set_model(Gtk.StringList.new(
+            ["Row — left to right", "Column — top to bottom"]))
+        self.layout_row.connect("notify::selected", self._on_layout_kind)
+        arrange.add(self.layout_row)
+
+        self.align_row = Adw.ComboRow(title="Align on")
+        self.align_row.set_model(Gtk.StringList.new(ALIGN_LABELS["row"]))
+        self.align_row.set_selected(1)
+        arrange.add(self.align_row)
+
+        tidy_row = Adw.ActionRow(
+            title="Tidy up",
+            subtitle="Pack displays in their current order, no gaps or overlaps")
+        tidy = Gtk.Button(label="Arrange")
+        tidy.set_valign(Gtk.Align.CENTER)
+        tidy.add_css_class("suggested-action")
+        tidy.connect("clicked", self._on_tidy)
+        tidy_row.add_suffix(tidy)
+        tidy_row.set_activatable_widget(tidy)
+        arrange.add(tidy_row)
+
+        orient_row = Adw.ActionRow(
+            title="Rotate every display",
+            subtitle="Flip all screens between landscape and portrait")
+        box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        land = Gtk.Button(label="Landscape")
+        land.connect("clicked", lambda *_: self._rotate_all(0))
+        port = Gtk.Button(label="Portrait")
+        port.connect("clicked", lambda *_: self._rotate_all(1))
+        box.append(land)
+        box.append(port)
+        orient_row.add_suffix(box)
+        arrange.add(orient_row)
+
+        page.add(arrange)
+
+        # --- Selected display --------------------------------------------
+        self.detail = Adw.PreferencesGroup(title="Display")
+
+        self.selector = Gtk.Box(spacing=0, homogeneous=True)
+        self.selector.add_css_class("linked")
+        self.selector.set_margin_bottom(6)
+        self.detail.set_header_suffix(None)
+        holder = Adw.PreferencesGroup()
+        holder.add(self._wrap(self.selector))
+        page.add(holder)
+
+        self.enabled_row = Adw.SwitchRow(title="Enabled")
+        self.enabled_row.connect("notify::active", self._on_enabled)
+        self.detail.add(self.enabled_row)
+
+        self.orient_row = Adw.ComboRow(title="Orientation")
+        self.orient_row.set_model(
+            Gtk.StringList.new([label for _, label in ORIENTATIONS]))
+        self.orient_row.connect("notify::selected", self._on_orientation)
+        self.detail.add(self.orient_row)
+
+        self.res_row = Adw.ComboRow(title="Resolution")
+        self.res_row.connect("notify::selected", self._on_resolution)
+        self.detail.add(self.res_row)
+
+        self.rate_row = Adw.ComboRow(title="Refresh rate")
+        self.rate_row.connect("notify::selected", self._on_rate)
+        self.detail.add(self.rate_row)
+
+        self.scale_row = Adw.ComboRow(title="Scale")
+        self.scale_row.connect("notify::selected", self._on_scale)
+        self.detail.add(self.scale_row)
+
+        self.x_row = Adw.SpinRow.new_with_range(-20000, 20000, 1)
+        self.x_row.set_title("Position X")
+        self.x_row.connect("notify::value", self._on_position)
+        self.detail.add(self.x_row)
+
+        self.y_row = Adw.SpinRow.new_with_range(-20000, 20000, 1)
+        self.y_row.set_title("Position Y")
+        self.y_row.connect("notify::value", self._on_position)
+        self.detail.add(self.y_row)
+
+        order_row = Adw.ActionRow(
+            title="Order",
+            subtitle="Swap this display with its neighbour in the layout")
+        order_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        earlier = Gtk.Button(icon_name="go-previous-symbolic")
+        earlier.set_tooltip_text("Move earlier (left, or up)")
+        earlier.connect("clicked", lambda *_: self._reorder(-1))
+        later = Gtk.Button(icon_name="go-next-symbolic")
+        later.set_tooltip_text("Move later (right, or down)")
+        later.connect("clicked", lambda *_: self._reorder(1))
+        order_box.append(earlier)
+        order_box.append(later)
+        order_row.add_suffix(order_box)
+        self.detail.add(order_row)
+
+        page.add(self.detail)
+
+        self.summary = Adw.PreferencesGroup(title="Preview")
+        self.summary_label = Gtk.Label(xalign=0.0, selectable=True)
+        self.summary_label.add_css_class("mono")
+        self.summary_label.add_css_class("dim-label")
+        self.summary_label.set_wrap(True)
+        self.summary.add(self._wrap(self.summary_label))
+        page.add(self.summary)
+
+        return page
+
+    @staticmethod
+    def _wrap(child: Gtk.Widget) -> Gtk.Widget:
+        row = Adw.PreferencesRow()
+        row.set_activatable(False)
+        child.set_margin_top(10)
+        child.set_margin_bottom(10)
+        child.set_margin_start(12)
+        child.set_margin_end(12)
+        row.set_child(child)
+        return row
+
+    # -- state -----------------------------------------------------------
+
+    def reload(self, reset_baseline: bool = False) -> None:
+        self.monitors = load_monitors()
+        if not self.monitors:
+            self._warn("No monitors reported by hyprctl — is Hyprland running?")
+        self.applied = [m.lua() for m in self.monitors]
+        if reset_baseline or not self.baseline:
+            self.baseline = [m.lua() for m in self.monitors]
+        self.selected = next((m for m in self.monitors if m.enabled),
+                             self.monitors[0] if self.monitors else None)
+        self._rebuild_selector()
+        self._sync_identify(restructure=True)
+        self.on_geometry_changed()
+
+    def _rebuild_selector(self) -> None:
+        child = self.selector.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.selector.remove(child)
+            child = nxt
+        self.buttons: dict[str, Gtk.ToggleButton] = {}
+        for mon in self.monitors:
+            btn = Gtk.ToggleButton(label=f"{mon.index}  {mon.name}")
+            btn.set_tooltip_text(mon.description)
+            btn.connect("toggled", self._on_selector, mon)
+            self.selector.append(btn)
+            self.buttons[mon.name] = btn
+
+    def select(self, mon: Monitor | None) -> None:
+        if mon is self.selected:
+            return
+        self.selected = mon
+        self.refresh_controls()
+        self.canvas.queue_draw()
+
+    def _on_selector(self, button: Gtk.ToggleButton, mon: Monitor) -> None:
+        if self._loading or not button.get_active():
+            return
+        self.select(mon)
+
+    def on_geometry_changed(self, redraw_only: bool = False) -> None:
+        self.canvas.queue_draw()
+        self._sync_identify()
+        if redraw_only:
+            self._sync_position_rows()
+            return
+        self.refresh_controls()
+        self._check()
+
+    def _sync_position_rows(self) -> None:
+        mon = self.selected
+        if mon is None:
+            return
+        self._loading = True
+        self.x_row.set_value(mon.x)
+        self.y_row.set_value(mon.y)
+        self._loading = False
+
+    def refresh_controls(self) -> None:
+        mon = self.selected
+        self._loading = True
+        try:
+            for name, btn in getattr(self, "buttons", {}).items():
+                btn.set_active(mon is not None and name == mon.name)
+
+            if mon is None:
+                self.detail.set_title("Display")
+                self.detail.set_sensitive(False)
+                return
+
+            self.detail.set_sensitive(True)
+            self.detail.set_title(f"{mon.index}. {mon.name}")
+            self.detail.set_description(mon.description)
+
+            self.enabled_row.set_active(mon.enabled)
+            for row in (self.orient_row, self.res_row, self.rate_row,
+                        self.scale_row, self.x_row, self.y_row):
+                row.set_sensitive(mon.enabled)
+
+            self.orient_row.set_selected(
+                ORIENTATION_VALUES.index(mon.transform)
+                if mon.transform in ORIENTATION_VALUES else 0)
+
+            resolutions = mon.resolutions()
+            self.res_row.set_model(Gtk.StringList.new(
+                [r.replace("x", " × ") for r in resolutions]))
+            self.res_row.set_selected(
+                resolutions.index(mon.mode.res) if mon.mode.res in resolutions else 0)
+
+            rates = mon.rates_for(mon.mode.res)
+            self.rate_row.set_model(Gtk.StringList.new([m.rate_label for m in rates]))
+            self.rate_row.set_selected(
+                rates.index(mon.mode) if mon.mode in rates else 0)
+
+            self._scales = scale_options(mon)
+            self.scale_row.set_model(Gtk.StringList.new(
+                [f"{s:g}×" for s in self._scales]))
+            nearest = min(range(len(self._scales)),
+                          key=lambda i: abs(self._scales[i] - mon.scale))
+            self.scale_row.set_selected(nearest)
+
+            self.x_row.set_value(mon.x)
+            self.y_row.set_value(mon.y)
+        finally:
+            self._loading = False
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        self.summary_label.set_text(render_block(self.monitors))
+
+    def _check(self) -> None:
+        problems = []
+        clashes = overlapping(self.monitors)
+        if clashes:
+            problems.append("Overlapping: " +
+                            ", ".join(f"{a} ↔ {b}" for a, b in clashes))
+        loose = disconnected(self.monitors)
+        if loose:
+            problems.append("Not touching any other display: " + ", ".join(loose))
+        for mon in active_of(self.monitors):
+            if not mon.scale_ok():
+                problems.append(f"{mon.name}: scale {mon.scale:g} is not exact for "
+                                f"{mon.mode.label} — Hyprland will adjust it")
+        if problems:
+            self._warn("  ·  ".join(problems))
+        else:
+            self.banner.set_revealed(False)
+        self._update_summary()
+
+    def _warn(self, text: str) -> None:
+        self.banner.set_title(text)
+        self.banner.set_revealed(True)
+
+    def _toast(self, text: str) -> None:
+        self.toasts.add_toast(Adw.Toast.new(text))
+
+    # -- control handlers ------------------------------------------------
+
+    def _on_layout_kind(self, row, _p) -> None:
+        kind = "row" if row.get_selected() == 0 else "column"
+        keep = self.align_row.get_selected()
+        self.align_row.set_model(Gtk.StringList.new(ALIGN_LABELS[kind]))
+        self.align_row.set_selected(keep if keep < 3 else 1)
+
+    def _layout_kind(self) -> str:
+        return "row" if self.layout_row.get_selected() == 0 else "column"
+
+    def _on_tidy(self, *_a) -> None:
+        kind = self._layout_kind()
+        axis = AXES[kind]
+        align = ALIGN_KEYS[min(self.align_row.get_selected(), 2)]
+        lay_out(order_along(self.monitors, axis), axis, align)
+        normalize(self.monitors)
+        self.on_geometry_changed()
+
+    def _rotate_all(self, transform: int) -> None:
+        for mon in active_of(self.monitors):
+            mon.transform = transform
+        self._on_tidy()
+
+    def _reorder(self, delta: int) -> None:
+        mon = self.selected
+        if mon is None or not mon.enabled:
+            return
+        axis = AXES[self._layout_kind()]
+        ordered = order_along(self.monitors, axis)
+        if mon not in ordered:
+            return
+        i = ordered.index(mon)
+        j = i + delta
+        if not 0 <= j < len(ordered):
+            return
+        ordered[i], ordered[j] = ordered[j], ordered[i]
+        align = ALIGN_KEYS[min(self.align_row.get_selected(), 2)]
+        lay_out(ordered, axis, align)
+        normalize(self.monitors)
+        self.on_geometry_changed()
+
+    def _on_enabled(self, row, _p) -> None:
+        if self._loading or self.selected is None:
+            return
+        if not row.get_active() and len(active_of(self.monitors)) <= 1:
+            self._loading = True
+            row.set_active(True)
+            self._loading = False
+            self._toast("At least one display has to stay on")
+            return
+        self.selected.enabled = row.get_active()
+        normalize(self.monitors)
+        self._sync_identify(restructure=True)
+        self.on_geometry_changed()
+
+    def _on_orientation(self, row, _p) -> None:
+        if self._loading or self.selected is None:
+            return
+        self.selected.transform = ORIENTATION_VALUES[row.get_selected()]
+        normalize(self.monitors)
+        self.on_geometry_changed()
+
+    def _on_resolution(self, row, _p) -> None:
+        if self._loading or self.selected is None:
+            return
+        mon = self.selected
+        resolutions = mon.resolutions()
+        idx = row.get_selected()
+        if not 0 <= idx < len(resolutions):
+            return
+        rates = mon.rates_for(resolutions[idx])
+        if rates:
+            mon.mode = rates[0]
+            if not mon.scale_ok():
+                mon.scale = mon.nearest_scale()
+        normalize(self.monitors)
+        self.on_geometry_changed()
+
+    def _on_rate(self, row, _p) -> None:
+        if self._loading or self.selected is None:
+            return
+        mon = self.selected
+        rates = mon.rates_for(mon.mode.res)
+        idx = row.get_selected()
+        if 0 <= idx < len(rates):
+            mon.mode = rates[idx]
+        self._update_summary()
+
+    def _on_scale(self, row, _p) -> None:
+        if self._loading or self.selected is None:
+            return
+        idx = row.get_selected()
+        if 0 <= idx < len(getattr(self, "_scales", [])):
+            self.selected.scale = self._scales[idx]
+        normalize(self.monitors)
+        self.on_geometry_changed()
+
+    def _on_position(self, row, _p) -> None:
+        if self._loading or self.selected is None:
+            return
+        self.selected.x = int(self.x_row.get_value())
+        self.selected.y = int(self.y_row.get_value())
+        self.canvas.queue_draw()
+        self._check()
+
+    # -- identify / apply / save ------------------------------------------
+
+    def _on_identify(self, button: Gtk.ToggleButton) -> None:
+        if button.get_active():
+            self._sync_identify(restructure=True)
+            self._toast("Grid stays up while you drag — line the major lines "
+                        "up across the bezel to match the offset")
+        else:
+            self.identify.hide(notify=False)
+
+    def _identify_hidden(self) -> None:
+        """The overlay dismissed itself; put the toggle back."""
+        if self.identify_button.get_active():
+            self.identify_button.set_active(False)
+
+    def _sync_identify(self, restructure: bool = False) -> None:
+        """Keep the on-screen grids showing the arrangement being edited."""
+        if not self.identify_button.get_active():
+            return
+        self.identify.pending = [m.lua() for m in self.monitors] != self.applied
+        if restructure or not self.identify.visible:
+            self.identify.show(self.monitors)
+        else:
+            self.identify.rebind(self.monitors)
+
+    def _on_apply(self, *_a) -> None:
+        ok, message = apply_monitors(self.monitors)
+        if not ok:
+            self._warn(f"Could not apply: {message[:160]}")
+            return
+        self.banner.set_revealed(False)
+        self.applied = [m.lua() for m in self.monitors]
+        GLib.timeout_add(400, self._reidentify)
+        self._confirm_keep()
+
+    def _reidentify(self) -> bool:
+        self._sync_identify(restructure=True)
+        return GLib.SOURCE_REMOVE
+
+    def _confirm_keep(self) -> None:
+        dialog = Adw.AlertDialog(heading="Keep this arrangement?")
+        dialog.add_response("revert", "Revert")
+        dialog.add_response("keep", "Keep")
+        dialog.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_response_appearance("revert", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("keep")
+        dialog.set_close_response("revert")
+
+        state = {"left": REVERT_SECONDS, "source": 0}
+
+        def body(seconds: int) -> str:
+            return (f"Reverting to the previous setup in {seconds} s.\n"
+                    "Nothing has been written to monitors.lua yet.")
+
+        dialog.set_body(body(state["left"]))
+
+        def tick() -> bool:
+            state["left"] -= 1
+            if state["left"] <= 0:
+                state["source"] = 0
+                dialog.close()
+                return GLib.SOURCE_REMOVE
+            dialog.set_body(body(state["left"]))
+            return GLib.SOURCE_CONTINUE
+
+        state["source"] = GLib.timeout_add_seconds(1, tick)
+
+        def responded(_d, response: str) -> None:
+            if state["source"]:
+                GLib.source_remove(state["source"])
+                state["source"] = 0
+            if response == "keep":
+                self.baseline = [m.lua() for m in self.monitors]
+                self._toast("Applied. Save to keep it across restarts.")
+            else:
+                hyprctl_eval("\n".join(self.baseline))
+                self.reload()
+                self._toast("Reverted")
+
+        dialog.connect("response", responded)
+        dialog.present(self)
+
+    def _on_save(self, *_a) -> None:
+        ok, message = apply_monitors(self.monitors)
+        if not ok:
+            self._warn(f"Could not apply: {message[:160]}")
+            return
+        ok, message = save_lua(self.monitors)
+        if ok:
+            self.baseline = [m.lua() for m in self.monitors]
+            self.applied = list(self.baseline)
+            self.banner.set_revealed(False)
+            self._sync_identify(restructure=True)
+            self._toast(message)
+        else:
+            self._warn(message)
+
+    def _on_close(self, *_a) -> bool:
+        self.identify.hide()
+        return False
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+class Application(Adw.Application):
+
+    def __init__(self) -> None:
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self) -> None:
+        window = self.props.active_window or MonitorAlign(self)
+        window.present()
+
+
+def run_identify_only(seconds: int) -> int:
+    """`monitor-align --identify` - just flash the grid, no window."""
+    app = Adw.Application(application_id=APP_ID + ".Identify")
+
+    def activate(_a) -> None:
+        overlay = IdentifyOverlay(Palette())
+        overlay.show(load_monitors(), seconds)
+        if not overlay.visible:
+            app.quit()
+            return
+        GLib.timeout_add_seconds(seconds + 1, lambda: (app.quit(), GLib.SOURCE_REMOVE)[1])
+        app.hold()
+
+    app.connect("activate", activate)
+    return app.run([])
+
+
+def main(argv: list[str]) -> int:
+    if "--version" in argv:
+        print(f"monitor-align {VERSION}")
+        return 0
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        print("monitor-align needs a Wayland session (Hyprland).", file=sys.stderr)
+        return 1
+    if not shutil.which("hyprctl"):
+        print("hyprctl not found — this tool targets Hyprland.", file=sys.stderr)
+        return 1
+    if "--identify" in argv:
+        rest = [a for a in argv[argv.index("--identify") + 1:] if a.isdigit()]
+        return run_identify_only(int(rest[0]) if rest else IDENTIFY_SECONDS)
+    return Application().run([])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

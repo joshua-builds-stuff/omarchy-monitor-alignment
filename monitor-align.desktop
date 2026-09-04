@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor Align
+GenericName=Display Arrangement
+Comment=Arrange, rotate and align your monitors with an on-screen grid
+TryExec=monitor-align
+Exec=monitor-align
+Icon=video-display
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.omarchy.MonitorAlign
+Categories=Settings;HardwareSettings;
+Keywords=monitor;display;screen;arrange;align;rotate;resolution;refresh;portrait;landscape;
+Actions=Identify;
+
+[Desktop Action Identify]
+Name=Identify Screens
+Exec=monitor-align --identify 15
