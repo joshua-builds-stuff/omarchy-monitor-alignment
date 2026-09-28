@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -212,6 +214,95 @@ class TryItConfirmationTests(unittest.TestCase):
         self.try_it("B")
         self.assertIs(stale_tick(), False)
         self.assertEqual(self.evals, [])
+
+
+class SaveLuaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "hypr", "monitors.lua")
+        self.saved = (APP.MONITORS_LUA, APP.hyprctl, APP.apply_monitors)
+        APP.MONITORS_LUA = self.path
+        self.errors_before = "no errors"
+        self.errors_after = "no errors"
+        self.apply_result = (True, "ok")
+        self.reloaded = False
+
+        def fake_hyprctl(*args):
+            if args == ("reload",):
+                self.reloaded = True
+                return "ok"
+            if args == ("configerrors",):
+                return self.errors_after if self.reloaded else self.errors_before
+            return ""
+
+        APP.hyprctl = fake_hyprctl
+        APP.apply_monitors = lambda _m: self.apply_result
+        mode = APP.Mode(1920, 1080, 60.0)
+        self.monitors = [APP.Monitor(name="DP-1", description="", modes=[mode],
+                                     mode=mode, scale=1.0, transform=0, x=0, y=0,
+                                     enabled=True, index=1)]
+
+    def tearDown(self) -> None:
+        APP.MONITORS_LUA, APP.hyprctl, APP.apply_monitors = self.saved
+        self.tmp.cleanup()
+
+    def write_original(self, text: str = "-- mine\n") -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w") as handle:
+            handle.write(text)
+
+    def read(self) -> str:
+        with open(self.path) as handle:
+            return handle.read()
+
+    def test_pre_existing_config_errors_do_not_fail_save(self) -> None:
+        self.write_original()
+        self.errors_before = "hyprland.lua:3: unrelated"
+        self.errors_after = "hyprland.lua:3: unrelated"
+        ok, message = APP.save_lua(self.monitors)
+        self.assertTrue(ok, message)
+        self.assertIn(APP.BLOCK_BEGIN, self.read())
+
+    def test_new_config_error_restores_backup_and_names_it(self) -> None:
+        self.write_original()
+        self.errors_after = "monitors.lua:4: bad"
+        ok, message = APP.save_lua(self.monitors)
+        self.assertFalse(ok)
+        self.assertIn("monitors.lua:4: bad", message)
+        self.assertIn("monitors.lua.bak.", message)
+        self.assertEqual(self.read(), "-- mine\n")
+
+    def test_failed_live_apply_is_reported_and_rolled_back(self) -> None:
+        self.write_original()
+        self.apply_result = (False, "nope")
+        ok, message = APP.save_lua(self.monitors)
+        self.assertFalse(ok)
+        self.assertIn("nope", message)
+        self.assertEqual(self.read(), "-- mine\n")
+
+    def test_failed_first_save_removes_new_file(self) -> None:
+        self.errors_after = "monitors.lua:2: bad"
+        ok, _message = APP.save_lua(self.monitors)
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_write_error_leaves_original_and_names_backup(self) -> None:
+        self.write_original()
+        real_replace = os.replace
+
+        def broken_replace(*_a):
+            raise OSError("disk full")
+
+        APP.os.replace = broken_replace
+        try:
+            ok, message = APP.save_lua(self.monitors)
+        finally:
+            APP.os.replace = real_replace
+        self.assertFalse(ok)
+        self.assertIn("disk full", message)
+        self.assertIn("monitors.lua.bak.", message)
+        self.assertEqual(self.read(), "-- mine\n")
+        self.assertFalse(any(".tmp." in f for f in os.listdir(os.path.dirname(self.path))))
 
 
 class PublicationPrivacyTests(unittest.TestCase):
