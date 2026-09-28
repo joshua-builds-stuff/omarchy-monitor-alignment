@@ -240,6 +240,48 @@ def parse_mode(text: str) -> Mode | None:
         return None
 
 
+SCALE_STEPS = 120  # Hyprland only honours scales on a 1/120 lattice
+
+
+def scale_fits(mode: Mode, scale: float) -> bool:
+    """True when `scale` is on the lattice and divides the mode exactly."""
+    steps = scale * SCALE_STEPS
+    if scale <= 0 or abs(steps - round(steps)) > 1e-6:
+        return False
+    return all(abs(side / scale - round(side / scale)) < 1e-4
+               for side in (mode.w, mode.h))
+
+
+def valid_scales_for(mode: Mode) -> list[float]:
+    """Exact k/120 scales between 0.5 and 3 that give an integer logical size."""
+    return [step / SCALE_STEPS for step in range(60, 361)
+            if scale_fits(mode, step / SCALE_STEPS)]
+
+
+def snap_scale(mode: Mode, reported: float) -> float:
+    """Recover the real scale from hyprctl's two-decimal rendering of it.
+
+    `hyprctl -j monitors` prints the scale with `{:.2f}`, so 4/3 arrives as
+    1.33 and 5/3 as 1.67. Pick the valid lattice scale that could have been
+    printed that way; failing that, the nearest 1/120 step.
+    """
+    if reported <= 0:
+        return 1.0
+    near = [s for s in valid_scales_for(mode) if abs(s - reported) <= 0.0051]
+    if near:
+        return min(near, key=lambda s: abs(s - reported))
+    return max(1, round(reported * SCALE_STEPS)) / SCALE_STEPS
+
+
+def format_scale(scale: float) -> str:
+    """Enough digits for Hyprland to land back on the same 1/120 step."""
+    return f"{scale:.10g}"
+
+
+def scale_label(scale: float) -> str:
+    return f"{round(scale, 4):g}"
+
+
 @dataclass
 class Monitor:
     name: str
@@ -280,22 +322,10 @@ class Monitor:
                       key=lambda m: -m.rate)
 
     def scale_ok(self) -> bool:
-        snapped = round(self.scale * 120) / 120
-        if snapped <= 0:
-            return False
-        for side in (self.mode.w, self.mode.h):
-            if abs(side / snapped - round(side / snapped)) > 1e-4:
-                return False
-        return True
+        return scale_fits(self.mode, self.scale)
 
     def valid_scales(self) -> list[float]:
-        out = []
-        for step in range(60, 361):  # 0.50 .. 3.00 in 1/120 increments
-            s = step / 120
-            if all(abs(side / s - round(side / s)) < 1e-4
-                   for side in (self.mode.w, self.mode.h)):
-                out.append(round(s, 4))
-        return out
+        return valid_scales_for(self.mode)
 
     def nearest_scale(self) -> float:
         options = self.valid_scales()
@@ -309,7 +339,7 @@ class Monitor:
         return (f"hl.monitor({{ output = {lua_string(self.name)}, "
                 f'mode = "{self.mode.hypr}", '
                 f'position = "{self.x}x{self.y}", '
-                f'scale = {self.scale:g}, '
+                f'scale = {format_scale(self.scale)}, '
                 f'transform = {self.transform} }})')
 
 
@@ -338,13 +368,13 @@ def load_monitors() -> list[Monitor]:
             mode = Mode(1920, 1080, 60.0)
         if not modes:
             modes = [mode]
-        scale = float(entry.get("scale") or 1.0)
+        scale = snap_scale(mode, float(entry.get("scale") or 1.0))
         monitors.append(Monitor(
             name=entry.get("name", "?"),
             description=entry.get("description", ""),
             modes=modes,
             mode=mode,
-            scale=scale if scale > 0 else 1.0,
+            scale=scale,
             transform=int(entry.get("transform") or 0),
             x=int(entry.get("x") or 0),
             y=int(entry.get("y") or 0),
@@ -745,7 +775,7 @@ class IdentifyOverlay:
         text_at(cr, mon.name, cx, below, 26, pal.bright_foreground, 1.0, bold=True,
                 anchor="n")
         detail = (f"{mon.mode.label} @ {mon.mode.rate:.2f} Hz   ·   "
-                  f"scale {mon.scale:g}   ·   {TRANSFORMS[mon.transform][1]}")
+                  f"scale {scale_label(mon.scale)}   ·   {TRANSFORMS[mon.transform][1]}")
         text_at(cr, detail, cx, below + 38, 12, pal.foreground, 0.95, anchor="n")
         text_at(cr, mon.description, cx, below + 60, 10, pal.foreground,
                 0.75, anchor="n")
@@ -1089,26 +1119,76 @@ def save_lua(monitors: list[Monitor]) -> tuple[bool, str]:
     body = original.rstrip("\n")
     new = (body + "\n\n" if body else "") + render_block(monitors) + "\n"
 
+    # Errors Hyprland already had are not ours to fail on.
+    before = config_errors()
+
     backup = ""
     try:
         if os.path.exists(MONITORS_LUA):
             backup = f"{MONITORS_LUA}.bak.{int(time.time())}"
             shutil.copy2(MONITORS_LUA, backup)
         os.makedirs(os.path.dirname(MONITORS_LUA), exist_ok=True)
-        with open(MONITORS_LUA, "w") as handle:
-            handle.write(new)
+        write_atomic(MONITORS_LUA, new)
     except OSError as exc:
-        return False, str(exc)
+        note = f" (original kept; backup: {os.path.basename(backup)})" if backup else ""
+        return False, f"{exc}{note}"
 
     hyprctl("reload")
     # The stock catch-all rule uses position = "auto", so a reload can shuffle
     # the desk before our block is honoured. Re-assert the explicit geometry.
-    apply_monitors(monitors)
-    errors = hyprctl("configerrors")
-    if errors and "no errors" not in errors.lower():
-        return False, errors.splitlines()[0][:160]
+    ok, message = apply_monitors(monitors)
+    problem = "" if ok else f"Could not apply after reload: {message[:160]}"
+    if not problem:
+        new_errors = sorted(config_errors() - before)
+        if new_errors:
+            problem = new_errors[0][:160]
+    if problem:
+        return False, problem + restore_backup(backup)
     note = f" (backup: {os.path.basename(backup)})" if backup else ""
     return True, f"Saved to monitors.lua{note}"
+
+
+def config_errors() -> set[str]:
+    text = hyprctl("configerrors")
+    if not text or "no errors" in text.lower():
+        return set()
+    return {line.strip() for line in text.splitlines() if line.strip()}
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Replace `path` in one step so a failed write never truncates it."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.path.exists(path):
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def restore_backup(backup: str) -> str:
+    """Put the pre-save monitors.lua back after a failed save; describe it."""
+    try:
+        if backup:
+            with open(backup, "r") as handle:
+                write_atomic(MONITORS_LUA, handle.read())
+        else:
+            os.unlink(MONITORS_LUA)
+    except OSError as exc:
+        where = f"; restore it from {os.path.basename(backup)}" if backup else ""
+        return f" — could not roll back monitors.lua ({exc}){where}"
+    hyprctl("reload")
+    if backup:
+        return f" — monitors.lua restored from {os.path.basename(backup)}"
+    return " — new monitors.lua removed"
 
 
 # --------------------------------------------------------------------------
@@ -1140,7 +1220,7 @@ def scale_options(mon: Monitor) -> list[float]:
         if abs(near - want) < 0.01:
             opts.append(near)
     if not any(abs(mon.scale - o) < 1e-3 for o in opts):
-        opts.append(round(mon.scale, 4))
+        opts.append(mon.scale)
     return sorted(set(opts))
 
 
@@ -1157,6 +1237,7 @@ class MonitorAlign(Adw.ApplicationWindow):
         self.applied: list[str] = []    # what the compositor is showing now
         self.identify = IdentifyOverlay(self.pal, on_hidden=self._identify_hidden)
         self._loading = False
+        self._pending: dict | None = None  # the open Keep/Revert prompt
 
         provider = Gtk.CssProvider()
         provider.load_from_string(self.pal.css())
@@ -1466,7 +1547,7 @@ class MonitorAlign(Adw.ApplicationWindow):
 
             self._scales = scale_options(mon)
             self.scale_row.set_model(Gtk.StringList.new(
-                [f"{s:g}×" for s in self._scales]))
+                [f"{scale_label(s)}×" for s in self._scales]))
             nearest = min(range(len(self._scales)),
                           key=lambda i: abs(self._scales[i] - mon.scale))
             self.scale_row.set_selected(nearest)
@@ -1491,7 +1572,7 @@ class MonitorAlign(Adw.ApplicationWindow):
             problems.append("Not touching any other display: " + ", ".join(loose))
         for mon in active_of(self.monitors):
             if not mon.scale_ok():
-                problems.append(f"{mon.name}: scale {mon.scale:g} is not exact for "
+                problems.append(f"{mon.name}: scale {scale_label(mon.scale)} is not exact for "
                                 f"{mon.mode.label} — Hyprland will adjust it")
         if problems:
             self._warn("  ·  ".join(problems))
@@ -1609,8 +1690,7 @@ class MonitorAlign(Adw.ApplicationWindow):
             return
         self.selected.x = int(self.x_row.get_value())
         self.selected.y = int(self.y_row.get_value())
-        self.canvas.queue_draw()
-        self._check()
+        self.on_geometry_changed()
 
     # -- identify / apply / save ------------------------------------------
 
@@ -1651,7 +1731,21 @@ class MonitorAlign(Adw.ApplicationWindow):
         self._sync_identify(restructure=True)
         return GLib.SOURCE_REMOVE
 
+    def _dismiss_pending(self) -> None:
+        """Retire the open Keep/Revert prompt without acting on it."""
+        state = self._pending
+        if state is None:
+            return
+        self._pending = None
+        if state["source"]:
+            GLib.source_remove(state["source"])
+            state["source"] = 0
+        state["dialog"].force_close()
+
     def _confirm_keep(self) -> None:
+        # Only one prompt at a time: a newer Try it replaces the old prompt, and
+        # its revert still goes back to the last kept arrangement.
+        self._dismiss_pending()
         dialog = Adw.AlertDialog(heading="Keep this arrangement?")
         dialog.add_response("revert", "Revert")
         dialog.add_response("keep", "Keep")
@@ -1660,7 +1754,9 @@ class MonitorAlign(Adw.ApplicationWindow):
         dialog.set_default_response("keep")
         dialog.set_close_response("revert")
 
-        state = {"left": REVERT_SECONDS, "source": 0}
+        state = {"left": REVERT_SECONDS, "source": 0, "dialog": dialog,
+                 "keep": list(self.applied), "revert": list(self.baseline)}
+        self._pending = state
 
         def body(seconds: int) -> str:
             return (f"Reverting to the previous setup in {seconds} s.\n"
@@ -1669,6 +1765,9 @@ class MonitorAlign(Adw.ApplicationWindow):
         dialog.set_body(body(state["left"]))
 
         def tick() -> bool:
+            if state is not self._pending:
+                state["source"] = 0
+                return GLib.SOURCE_REMOVE
             state["left"] -= 1
             if state["left"] <= 0:
                 state["source"] = 0
@@ -1680,14 +1779,17 @@ class MonitorAlign(Adw.ApplicationWindow):
         state["source"] = GLib.timeout_add_seconds(1, tick)
 
         def responded(_d, response: str) -> None:
+            if state is not self._pending:
+                return  # superseded by a newer Try it
+            self._pending = None
             if state["source"]:
                 GLib.source_remove(state["source"])
                 state["source"] = 0
             if response == "keep":
-                self.baseline = [m.lua() for m in self.monitors]
+                self.baseline = state["keep"]
                 self._toast("Applied. Save to keep it across restarts.")
             else:
-                hyprctl_eval("\n".join(self.baseline))
+                hyprctl_eval("\n".join(state["revert"]))
                 self.reload()
                 self._toast("Reverted")
 
@@ -1701,6 +1803,7 @@ class MonitorAlign(Adw.ApplicationWindow):
             return
         ok, message = save_lua(self.monitors)
         if ok:
+            self._dismiss_pending()
             self.baseline = [m.lua() for m in self.monitors]
             self.applied = list(self.baseline)
             self.banner.set_revealed(False)
