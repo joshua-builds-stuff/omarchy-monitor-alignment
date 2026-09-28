@@ -41,12 +41,14 @@ Launch **Monitor Align** from the application menu or run:
 monitor-align
 ```
 
+The steps below are the short path. [docs/how-to.md](docs/how-to.md) walks through scale snapping, Identify, the single Try it confirmation, and Save.
+
 In the window:
 
-1. Drag displays or edit their position, orientation, resolution, refresh rate, and scale.
-2. Use **Identify** to draw numbered coordinate grids on the physical displays.
-3. Select **Try it** to apply the arrangement temporarily. Confirm within 15 seconds or it reverts to the previous live arrangement.
-4. Select **Save** to apply the arrangement and write the generated block to `~/.config/hypr/monitors.lua`.
+1. Drag displays or edit their position, orientation, resolution, refresh rate, and scale. Scales read from `hyprctl` are snapped onto Hyprland's 1/120 lattice before they are stored. When that step is valid for the mode, a printed `1.33` is kept as `4/3` (`160/120`) and a printed `1.67` as `5/3` (`200/120`). **Arrange**, edge snapping, and Identify compute logical size from the snapped scale, and the generated Lua writes that same scale.
+2. Use **Identify** to draw numbered coordinate grids on the physical displays. While the toggle is on, the grids follow the arrangement being edited, including **Position X** and **Position Y**. When that arrangement's generated Lua differs from the arrangement last applied, each grid draws a **PREVIEW** chip: `PREVIEW — press “Try it” to move the screens`.
+3. Select **Try it** to apply the arrangement live. One **Keep this arrangement?** dialog counts down from 15 seconds. **Keep** retains the arrangement that was just applied. **Revert**, closing the dialog, or the end of the countdown returns to the last kept arrangement. A newer **Try it** replaces that dialog and cancels its timer, so only the newest countdown can revert. Try it does not write `monitors.lua`.
+4. Select **Save** to apply the arrangement and write the generated block to `~/.config/hypr/monitors.lua`. The new text is written to a temporary file and renamed into place. Config errors Hyprland already reported are ignored. After `hyprctl reload`, if the following re-apply fails, or Hyprland reports a new config error, the previous file is restored. A file this save created is removed instead.
 
 The save operation preserves content outside the marked `monitor-align` block. If `monitors.lua` already exists, the app first makes a timestamped backup beside it, named `monitors.lua.bak.<timestamp>`.
 
@@ -70,7 +72,7 @@ Run the standard-library regression suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-The tests cover Lua serialization, generated-comment safety, and accidental publication of maintainer home paths.
+The tests cover Lua serialization, generated-comment safety, fractional scale snapping, the single Try it confirmation, save rollback, Identify updates from Position X/Y, and accidental publication of maintainer home paths.
 
 ## Privacy and security
 
@@ -78,7 +80,7 @@ The application runs as the current desktop user and does not use `sudo`, contac
 
 Monitor metadata is treated as untrusted when it is written into generated Lua: connector names are string-escaped and descriptions are constrained to inert, single-line comments. Subprocesses use argument arrays without a command shell.
 
-`Try it` has a timed live rollback. `Save` is intentionally persistent; review the preview before using it. Backups are not automatically pruned.
+`Try it` has a timed live rollback and does not write `monitors.lua`. A successful `Save` is persistent. If saving cannot re-apply the arrangement, or Hyprland reports a new config error, the previous `monitors.lua` is restored; a file created by that save is removed. Review the preview before using Save. Backups are not automatically pruned.
 
 For vulnerability reports, use GitHub's private security advisory feature rather than a public issue.
 
