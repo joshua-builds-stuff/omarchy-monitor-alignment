@@ -96,6 +96,124 @@ class FractionalScaleTests(unittest.TestCase):
         self.assertEqual(APP.snap_scale(mode, 1.33), 160 / 120)
 
 
+class FakeDialog:
+    def __init__(self, **_kw) -> None:
+        self.handlers = []
+        self.closed = False
+
+    def connect(self, _signal, handler) -> None:
+        self.handlers.append(handler)
+
+    def respond(self, response: str) -> None:
+        for handler in self.handlers:
+            handler(self, response)
+
+    def force_close(self) -> None:
+        self.closed = True
+
+    def close(self) -> None:
+        self.respond("revert")
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class FakeGLib:
+    SOURCE_REMOVE = False
+    SOURCE_CONTINUE = True
+
+    def __init__(self) -> None:
+        self.timers = {}
+        self.next_id = 1
+
+    def timeout_add_seconds(self, _secs, fn) -> int:
+        self.next_id += 1
+        self.timers[self.next_id] = fn
+        return self.next_id
+
+    def source_remove(self, source) -> None:
+        self.timers.pop(source, None)
+
+
+class TryItConfirmationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dialogs: list[FakeDialog] = []
+        self.evals: list[str] = []
+        self.saved = (APP.Adw, APP.GLib, APP.hyprctl_eval)
+
+        def make_dialog(**kw):
+            dialog = FakeDialog(**kw)
+            self.dialogs.append(dialog)
+            return dialog
+
+        APP.Adw = type("Adw", (), {"AlertDialog": staticmethod(make_dialog),
+                                   "ResponseAppearance": type("RA", (), {
+                                       "SUGGESTED": 1, "DESTRUCTIVE": 2})})
+        self.glib = FakeGLib()
+        APP.GLib = self.glib
+        APP.hyprctl_eval = lambda chunk: (self.evals.append(chunk), (True, "ok"))[1]
+
+        cls = APP.MonitorAlign
+
+        class Window:
+            _dismiss_pending = cls._dismiss_pending
+            _confirm_keep = cls._confirm_keep
+
+            def __init__(self) -> None:
+                self._pending = None
+                self.baseline = ["kept"]
+                self.applied = ["kept"]
+                self.reloads = 0
+
+            def reload(self) -> None:
+                self.reloads += 1
+
+            def _toast(self, _text) -> None:
+                pass
+
+        self.win = Window()
+
+    def tearDown(self) -> None:
+        APP.Adw, APP.GLib, APP.hyprctl_eval = self.saved
+
+    def try_it(self, layout: str) -> FakeDialog:
+        self.win.applied = [layout]
+        self.win._confirm_keep()
+        return self.dialogs[-1]
+
+    def test_second_try_replaces_first_prompt(self) -> None:
+        first = self.try_it("A")
+        second = self.try_it("B")
+        self.assertTrue(first.closed)
+        self.assertEqual(len(self.glib.timers), 1)
+        first.respond("revert")  # stale: must not touch the live layout
+        self.assertEqual(self.evals, [])
+        self.assertEqual(self.win.reloads, 0)
+        second.respond("keep")
+        self.assertEqual(self.win.baseline, ["B"])
+
+    def test_revert_uses_last_kept_layout_captured_at_open(self) -> None:
+        self.try_it("A")
+        second = self.try_it("B")
+        self.win.baseline = ["changed-after-open"]
+        second.respond("revert")
+        self.assertEqual(self.evals, ["kept"])
+        self.assertEqual(self.win.reloads, 1)
+
+    def test_keep_stores_the_applied_layout_not_later_edits(self) -> None:
+        dialog = self.try_it("A")
+        self.win.applied = ["edited"]
+        dialog.respond("keep")
+        self.assertEqual(self.win.baseline, ["A"])
+
+    def test_stale_timer_stops_without_reverting(self) -> None:
+        self.try_it("A")
+        stale_tick = next(iter(self.glib.timers.values()))
+        self.try_it("B")
+        self.assertIs(stale_tick(), False)
+        self.assertEqual(self.evals, [])
+
+
 class PublicationPrivacyTests(unittest.TestCase):
     def test_tracked_release_files_do_not_contain_original_home_path(self) -> None:
         for path in (ROOT / "monitor-align", ROOT / "monitor-align.desktop"):
