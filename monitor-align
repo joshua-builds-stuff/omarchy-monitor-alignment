@@ -1190,6 +1190,7 @@ class MonitorAlign(Adw.ApplicationWindow):
         self.applied: list[str] = []    # what the compositor is showing now
         self.identify = IdentifyOverlay(self.pal, on_hidden=self._identify_hidden)
         self._loading = False
+        self._pending: dict | None = None  # the open Keep/Revert prompt
 
         provider = Gtk.CssProvider()
         provider.load_from_string(self.pal.css())
@@ -1684,7 +1685,21 @@ class MonitorAlign(Adw.ApplicationWindow):
         self._sync_identify(restructure=True)
         return GLib.SOURCE_REMOVE
 
+    def _dismiss_pending(self) -> None:
+        """Retire the open Keep/Revert prompt without acting on it."""
+        state = self._pending
+        if state is None:
+            return
+        self._pending = None
+        if state["source"]:
+            GLib.source_remove(state["source"])
+            state["source"] = 0
+        state["dialog"].force_close()
+
     def _confirm_keep(self) -> None:
+        # Only one prompt at a time: a newer Try it replaces the old prompt, and
+        # its revert still goes back to the last kept arrangement.
+        self._dismiss_pending()
         dialog = Adw.AlertDialog(heading="Keep this arrangement?")
         dialog.add_response("revert", "Revert")
         dialog.add_response("keep", "Keep")
@@ -1693,7 +1708,9 @@ class MonitorAlign(Adw.ApplicationWindow):
         dialog.set_default_response("keep")
         dialog.set_close_response("revert")
 
-        state = {"left": REVERT_SECONDS, "source": 0}
+        state = {"left": REVERT_SECONDS, "source": 0, "dialog": dialog,
+                 "keep": list(self.applied), "revert": list(self.baseline)}
+        self._pending = state
 
         def body(seconds: int) -> str:
             return (f"Reverting to the previous setup in {seconds} s.\n"
@@ -1702,6 +1719,9 @@ class MonitorAlign(Adw.ApplicationWindow):
         dialog.set_body(body(state["left"]))
 
         def tick() -> bool:
+            if state is not self._pending:
+                state["source"] = 0
+                return GLib.SOURCE_REMOVE
             state["left"] -= 1
             if state["left"] <= 0:
                 state["source"] = 0
@@ -1713,14 +1733,17 @@ class MonitorAlign(Adw.ApplicationWindow):
         state["source"] = GLib.timeout_add_seconds(1, tick)
 
         def responded(_d, response: str) -> None:
+            if state is not self._pending:
+                return  # superseded by a newer Try it
+            self._pending = None
             if state["source"]:
                 GLib.source_remove(state["source"])
                 state["source"] = 0
             if response == "keep":
-                self.baseline = [m.lua() for m in self.monitors]
+                self.baseline = state["keep"]
                 self._toast("Applied. Save to keep it across restarts.")
             else:
-                hyprctl_eval("\n".join(self.baseline))
+                hyprctl_eval("\n".join(state["revert"]))
                 self.reload()
                 self._toast("Reverted")
 
@@ -1734,6 +1757,7 @@ class MonitorAlign(Adw.ApplicationWindow):
             return
         ok, message = save_lua(self.monitors)
         if ok:
+            self._dismiss_pending()
             self.baseline = [m.lua() for m in self.monitors]
             self.applied = list(self.baseline)
             self.banner.set_revealed(False)
