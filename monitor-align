@@ -1693,8 +1693,7 @@ class MonitorAlign(Adw.ApplicationWindow):
             return
         self.selected.x = int(self.x_row.get_value())
         self.selected.y = int(self.y_row.get_value())
-        self.canvas.queue_draw()
-        self._check()
+        self.on_geometry_changed()
 
     # -- identify / apply / save ------------------------------------------
 
