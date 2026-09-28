@@ -305,6 +305,69 @@ class SaveLuaTests(unittest.TestCase):
         self.assertFalse(any(".tmp." in f for f in os.listdir(os.path.dirname(self.path))))
 
 
+class PositionRowTests(unittest.TestCase):
+    def test_position_nudge_updates_identify_overlay(self) -> None:
+        cls = APP.MonitorAlign
+        mode = APP.Mode(1920, 1080, 60.0)
+        mon = APP.Monitor(name="DP-1", description="", modes=[mode], mode=mode,
+                          scale=1.0, transform=0, x=0, y=0, enabled=True, index=1)
+
+        class Row:
+            def __init__(self, value) -> None:
+                self.value = value
+
+            def get_value(self):
+                return self.value
+
+        class Toggle:
+            def get_active(self) -> bool:
+                return True
+
+        class Overlay:
+            visible = True
+            pending = False
+            bound = None
+
+            def rebind(self, monitors) -> None:
+                self.bound = [(m.x, m.y) for m in monitors]
+
+            def show(self, monitors) -> None:
+                self.rebind(monitors)
+
+        class Canvas:
+            def queue_draw(self) -> None:
+                pass
+
+        class Window:
+            _on_position = cls._on_position
+            on_geometry_changed = cls.on_geometry_changed
+            _sync_identify = cls._sync_identify
+
+            def __init__(self) -> None:
+                self._loading = False
+                self.selected = mon
+                self.monitors = [mon]
+                self.applied = [mon.lua()]
+                self.x_row, self.y_row = Row(7), Row(-3)
+                self.identify_button = Toggle()
+                self.identify = Overlay()
+                self.canvas = Canvas()
+                self.checked = 0
+
+            def refresh_controls(self) -> None:
+                pass
+
+            def _check(self) -> None:
+                self.checked += 1
+
+        win = Window()
+        win._on_position(win.x_row, None)
+        self.assertEqual((mon.x, mon.y), (7, -3))
+        self.assertEqual(win.identify.bound, [(7, -3)])
+        self.assertTrue(win.identify.pending)
+        self.assertEqual(win.checked, 1)
+
+
 class PublicationPrivacyTests(unittest.TestCase):
     def test_tracked_release_files_do_not_contain_original_home_path(self) -> None:
         for path in (ROOT / "monitor-align", ROOT / "monitor-align.desktop"):
