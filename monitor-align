@@ -22,7 +22,7 @@ import sys
 import time
 import tomllib
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import cairo
 import gi
@@ -294,9 +294,6 @@ class Monitor:
     y: int
     enabled: bool
     index: int = 0
-
-    def copy(self) -> "Monitor":
-        return replace(self, modes=list(self.modes))
 
     @property
     def rotated(self) -> bool:
