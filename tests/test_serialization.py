@@ -63,6 +63,39 @@ class SerializationTests(unittest.TestCase):
         self.assertIn('output = "DP-1\\" }})\\\\nunsafe("', rendered)
 
 
+class FractionalScaleTests(unittest.TestCase):
+    def monitor(self, w: int, h: int, scale: float) -> "APP.Monitor":
+        mode = APP.Mode(w, h, 60.0)
+        return APP.Monitor(name="DP-1", description="", modes=[mode], mode=mode,
+                           scale=APP.snap_scale(mode, scale), transform=0,
+                           x=0, y=0, enabled=True, index=1)
+
+    def test_two_decimal_scales_snap_to_the_real_lattice_value(self) -> None:
+        self.assertEqual(self.monitor(2560, 1440, 1.33).scale, 160 / 120)
+        self.assertEqual(self.monitor(2560, 1600, 1.67).scale, 200 / 120)
+        self.assertEqual(self.monitor(1920, 1080, 1.25).scale, 1.25)
+
+    def test_snapped_scale_gives_exact_logical_size(self) -> None:
+        mon = self.monitor(2560, 1440, 1.33)
+        self.assertEqual(mon.logical, (1920, 1080))
+        self.assertTrue(mon.scale_ok())
+        self.assertEqual(self.monitor(2560, 1600, 1.67).logical, (1536, 960))
+
+    def test_raw_two_decimal_scale_is_flagged(self) -> None:
+        mode = APP.Mode(2560, 1440, 60.0)
+        self.assertFalse(APP.scale_fits(mode, 1.33))
+
+    def test_lua_scale_round_trips_to_the_same_step(self) -> None:
+        mon = self.monitor(2560, 1440, 1.33)
+        written = mon.lua().split("scale = ")[1].split(",")[0]
+        self.assertEqual(round(float(written) * 120), 160)
+        self.assertEqual(APP.snap_scale(mon.mode, float(written)), mon.scale)
+
+    def test_unfit_scale_falls_back_to_nearest_step(self) -> None:
+        mode = APP.Mode(1366, 768, 60.0)
+        self.assertEqual(APP.snap_scale(mode, 1.33), 160 / 120)
+
+
 class PublicationPrivacyTests(unittest.TestCase):
     def test_tracked_release_files_do_not_contain_original_home_path(self) -> None:
         for path in (ROOT / "monitor-align", ROOT / "monitor-align.desktop"):
