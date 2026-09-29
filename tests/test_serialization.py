@@ -368,6 +368,29 @@ class PositionRowTests(unittest.TestCase):
         self.assertEqual(win.checked, 1)
 
 
+class NormalizeTests(unittest.TestCase):
+    def monitor(self, name: str, w: int, h: int, x: int, y: int) -> "APP.Monitor":
+        mode = APP.Mode(w, h, 60.0)
+        return APP.Monitor(name=name, description="", modes=[mode], mode=mode,
+                           scale=1.0, transform=0, x=x, y=y, enabled=True, index=1)
+
+    def test_disabling_left_display_keeps_it_beside_the_shifted_group(self) -> None:
+        left = self.monitor("eDP-1", 1920, 1080, 0, 0)
+        right = self.monitor("DP-1", 2560, 1440, 1920, 0)
+        left.enabled = False
+        APP.normalize([left, right])
+        self.assertEqual((right.x, right.y), (0, 0))
+        self.assertEqual((left.x, left.y), (-1920, 0))
+
+    def test_disabling_top_display_keeps_it_above_the_shifted_group(self) -> None:
+        top = self.monitor("eDP-1", 1920, 1080, 0, 0)
+        bottom = self.monitor("DP-1", 1920, 1080, 0, 1080)
+        top.enabled = False
+        APP.normalize([top, bottom])
+        self.assertEqual((bottom.x, bottom.y), (0, 0))
+        self.assertEqual((top.x, top.y), (0, -1080))
+
+
 class PublicationPrivacyTests(unittest.TestCase):
     def test_tracked_release_files_do_not_contain_original_home_path(self) -> None:
         for path in (ROOT / "monitor-align", ROOT / "monitor-align.desktop"):
