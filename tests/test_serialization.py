@@ -153,7 +153,8 @@ class TryItConfirmationTests(unittest.TestCase):
                                        "SUGGESTED": 1, "DESTRUCTIVE": 2})})
         self.glib = FakeGLib()
         APP.GLib = self.glib
-        APP.hyprctl_eval = lambda chunk: (self.evals.append(chunk), (True, "ok"))[1]
+        self.eval_result = (True, "ok")
+        APP.hyprctl_eval = lambda chunk: (self.evals.append(chunk), self.eval_result)[1]
 
         cls = APP.MonitorAlign
 
@@ -166,12 +167,17 @@ class TryItConfirmationTests(unittest.TestCase):
                 self.baseline = ["kept"]
                 self.applied = ["kept"]
                 self.reloads = 0
+                self.toasts = []
+                self.warnings = []
 
             def reload(self) -> None:
                 self.reloads += 1
 
-            def _toast(self, _text) -> None:
-                pass
+            def _toast(self, text) -> None:
+                self.toasts.append(text)
+
+            def _warn(self, text) -> None:
+                self.warnings.append(text)
 
         self.win = Window()
 
@@ -207,6 +213,34 @@ class TryItConfirmationTests(unittest.TestCase):
         self.win.applied = ["edited"]
         dialog.respond("keep")
         self.assertEqual(self.win.baseline, ["A"])
+
+    def test_failed_revert_eval_keeps_model_and_warns(self) -> None:
+        dialog = self.try_it("A")
+        self.eval_result = (False, "output not found")
+        dialog.respond("revert")
+        self.assertEqual(self.evals, ["kept"])
+        self.assertEqual(self.win.reloads, 0)
+        self.assertEqual(self.win.applied, ["A"])
+        self.assertNotIn("Reverted", self.win.toasts)
+        self.assertEqual(len(self.win.warnings), 1)
+        self.assertIn("output not found", self.win.warnings[0])
+
+    def test_failed_countdown_revert_does_not_toast_success(self) -> None:
+        self.try_it("A")
+        self.eval_result = (False, "refused")
+        tick = next(iter(self.glib.timers.values()))
+        for _ in range(APP.REVERT_SECONDS):
+            tick()
+        self.assertEqual(self.win.reloads, 0)
+        self.assertNotIn("Reverted", self.win.toasts)
+        self.assertIn("refused", self.win.warnings[0])
+
+    def test_successful_revert_reloads_and_toasts(self) -> None:
+        dialog = self.try_it("A")
+        dialog.respond("revert")
+        self.assertEqual(self.win.reloads, 1)
+        self.assertEqual(self.win.toasts, ["Reverted"])
+        self.assertEqual(self.win.warnings, [])
 
     def test_stale_timer_stops_without_reverting(self) -> None:
         self.try_it("A")
