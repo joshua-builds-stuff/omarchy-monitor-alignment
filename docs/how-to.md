@@ -32,13 +32,15 @@ The **Scale** combo is built from the targets 1, 1.25, 1.3333, 1.5, 1.6, 1.75, 2
 
 Drag a display on the canvas. Edges and centres snap to neighbouring displays. The hint under the canvas describes that snap.
 
+The canvas records its zoom and offset when the drag starts. While the drag continues, repaints keep that projection, and the pointer's movement is divided by that zoom, so the display stays under the pointer. When the drag ends, the canvas refits to the desktop.
+
 **Position X** and **Position Y**, on the selected display, accept whole pixels from -20000 to 20000. Editing either of them updates the canvas immediately and leaves the other displays where they are.
 
 **Arrange**, under **Arrangement**, packs enabled displays edge to edge in their current order. **Direction** is `Row — left to right` or `Column — top to bottom`. **Align on** is `Top edges`, `Centers`, or `Bottom edges` in a row, and `Left edges`, `Centers`, or `Right edges` in a column. **Landscape** and **Portrait** under **Rotate every display** set every enabled display, then pack them the same way.
 
 **Order**, on the selected display, moves that display earlier or later in the current order (tooltips: “Move earlier (left, or up)” and “Move later (right, or down)”), then packs again. The **Enabled** switch turns the selected display on or off. Turning off the last enabled display is rejected with the toast `At least one display has to stay on`.
 
-After a drag ends, and after an accepted **Enabled** change, Arrange, Order, scale, orientation, or resolution, the desktop is shifted so the top-left of the enabled displays sits at `0,0`.
+After a drag ends, and after an accepted **Enabled** change, Arrange, Order, scale, orientation, or resolution, the desktop is shifted so the top-left of the enabled displays sits at `0,0`. Every display is shifted by that same amount, including disabled ones, so a disabled panel keeps its position relative to the enabled group. A disabled display that sat to the left or above that group can end at a negative origin.
 
 ## Identify
 
@@ -81,7 +83,7 @@ When the apply succeeds, one dialog is shown:
 
 **Keep** makes the arrangement that was just applied the one a later revert returns to, and toasts `Applied. Save to keep it across restarts.` Edits you make while the dialog is open are not what Keep stores.
 
-**Revert** puts the last kept arrangement back, reloads the window from `hyprctl`, and toasts `Reverted`. The last kept arrangement is the one captured when that dialog opened: the desk from launch, the last **Keep**, or the last successful **Save**.
+**Revert**, dismissing the dialog, or the countdown reaching zero applies the last kept arrangement. When that succeeds, the window reloads from `hyprctl` and toasts `Reverted`. When it fails, the banner shows `Could not revert:` and the error, the window is not reloaded, and `Reverted` is not toasted. The last kept arrangement is the one captured when that dialog opened: the desk from launch, the last **Keep**, or the last successful **Save**.
 
 Only one of these dialogs is pending. A second **Try it** closes the first dialog and cancels its timer before the new countdown starts. A response or tick from the older dialog does nothing, including when that older timer reaches zero. The new dialog still reverts to the last kept arrangement, not to the attempt it replaced.
 
@@ -95,7 +97,7 @@ Only one of these dialogs is pending. A second **Try it** closes the first dialo
 4. If the file already exists, it is copied to `monitors.lua.bak.<timestamp>` beside it. `<timestamp>` is the Unix time in seconds. Backups are not pruned.
 5. The new file is written to a temporary file in the same directory, flushed, and renamed over `monitors.lua`. A failed write leaves the existing file in place and removes the temporary file. When a backup was made, the banner includes `original kept` and the backup name.
 6. The app runs `hyprctl reload`, then applies the same explicit geometry again so a catch-all `position = "auto"` rule cannot leave the desk shuffled.
-7. If that re-apply fails, or `hyprctl configerrors` reports an error that was not in the set from step 3, the save fails. The previous file contents are written back by the same rename, or the new `monitors.lua` is removed when this save created it, and `hyprctl reload` runs again. When a backup was restored, the `hl.monitor` lines from its generated block are then applied again, the same way step 6 re-asserts the new block; if that re-apply fails, the banner adds `could not re-apply its layout:` and the error. The banner includes the failure and either `monitors.lua restored from monitors.lua.bak.<timestamp>` or `new monitors.lua removed`. If that restore fails, the banner says `could not roll back monitors.lua` and, when a backup exists, names that backup.
+7. If that re-apply fails, or `hyprctl configerrors` reports an error that was not in the set from step 3, the save fails. The previous file contents are written back by the same rename, or the new `monitors.lua` is removed when this save created it, and `hyprctl reload` runs again. When a backup was restored, the `hl.monitor` lines from its generated block are then applied again, the same way step 6 re-asserts the new block; if that re-apply fails, the banner adds `could not re-apply its layout:` and the error. A restored file with no generated block, and a file this save created, have no such lines, so only the reload runs. The banner includes the failure and either `monitors.lua restored from monitors.lua.bak.<timestamp>` or `new monitors.lua removed`. If that restore fails, the banner says `could not roll back monitors.lua` and, when a backup exists, names that backup.
 8. On success, an open Try it dialog is closed without reverting. The saved arrangement becomes the one a later Try it would revert to. The toast is `Saved to monitors.lua`, plus the backup name when a backup was made.
 
 Connector names in the generated Lua are string-escaped. Descriptions are kept on a single comment line. That handling is unchanged; see the README privacy section.
