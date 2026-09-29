@@ -1800,7 +1800,10 @@ class MonitorAlign(Adw.ApplicationWindow):
                 self.baseline = state["keep"]
                 self._toast("Applied. Save to keep it across restarts.")
             else:
-                hyprctl_eval("\n".join(state["revert"]))
+                ok, message = hyprctl_eval("\n".join(state["revert"]))
+                if not ok:
+                    self._warn(f"Could not revert: {message[:160]}")
+                    return
                 self.reload()
                 self._toast("Reverted")
 
