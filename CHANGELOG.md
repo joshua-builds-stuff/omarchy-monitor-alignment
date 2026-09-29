@@ -2,7 +2,14 @@
 
 All notable changes to this project are documented here.
 
-The application version remains **1.0.0**. The entry below is a minor revision of behavior already shipped on `main`.
+The application version remains **1.0.0**. The dated entries below are minor revisions of behavior already shipped on `main`.
+
+## 2026-09-29 (minor)
+
+- Shifted every display, including disabled ones, when moving the enabled group's top-left to `0,0`, so a disabled panel keeps its relative position (#16).
+- Froze the canvas zoom and offset for the duration of a drag so the display stays under the pointer, and refitted the canvas when the drag ends (#17).
+- When Keep/Revert cannot apply the previous arrangement, showed `Could not revert:` and did not toast `Reverted` or reload the window (#18).
+- After a failed Save restores `monitors.lua` from its backup, re-applied the `hl.monitor` lines from that file's generated block. If that re-apply fails, the banner adds `could not re-apply its layout:`. A backup with no generated block, and a file this save created, are reloaded without that re-apply (#19).
 
 ## 2026-09-28 (minor)
 
