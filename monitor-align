@@ -848,6 +848,7 @@ class Canvas(Gtk.DrawingArea):
         self.offset = (0.0, 0.0)
         self.drag_target: Monitor | None = None
         self.drag_origin = (0, 0)
+        self.drag_view = (1.0, (0.0, 0.0))
         self.guides: list[tuple[str, float]] = []
 
         self.set_hexpand(True)
@@ -886,6 +887,13 @@ class Canvas(Gtk.DrawingArea):
             (height - span_h * self.zoom) / 2 - ys0 * self.zoom,
         )
 
+    def _view(self, width: int, height: int) -> None:
+        """Refit, except mid-drag where the drag-begin projection is kept."""
+        if self.drag_target is None:
+            self._fit(width, height)
+        else:
+            self.zoom, self.offset = self.drag_view
+
     def to_widget(self, x: float, y: float) -> tuple[float, float]:
         return (x * self.zoom + self.offset[0], y * self.zoom + self.offset[1])
 
@@ -912,6 +920,7 @@ class Canvas(Gtk.DrawingArea):
         if mon is None:
             return
         self.drag_origin = (mon.x, mon.y)
+        self.drag_view = (self.zoom, self.offset)
         self.app.select(mon)
         self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
 
@@ -919,8 +928,9 @@ class Canvas(Gtk.DrawingArea):
         mon = self.drag_target
         if mon is None:
             return
-        nx = self.drag_origin[0] + dx / self.zoom
-        ny = self.drag_origin[1] + dy / self.zoom
+        zoom = self.drag_view[0]
+        nx = self.drag_origin[0] + dx / zoom
+        ny = self.drag_origin[1] + dy / zoom
         mon.x, mon.y, self.guides = self._snap(mon, nx, ny)
         self.app.on_geometry_changed(redraw_only=True)
 
@@ -930,6 +940,7 @@ class Canvas(Gtk.DrawingArea):
         self.drag_target = None
         self.guides = []
         normalize(self.app.monitors)
+        self._fit(self.get_width(), self.get_height())
         self.set_cursor(Gdk.Cursor.new_from_name("grab", None))
         self.app.on_geometry_changed()
 
@@ -976,7 +987,7 @@ class Canvas(Gtk.DrawingArea):
 
     def _draw(self, _area, cr, width, height) -> None:
         pal = self.pal
-        self._fit(width, height)
+        self._view(width, height)
 
         cr.set_source_rgba(*pal.darker_background, 1.0)
         cr.paint()
