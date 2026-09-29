@@ -390,6 +390,78 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual((bottom.x, bottom.y), (0, 0))
         self.assertEqual((top.x, top.y), (0, -1080))
 
+class CanvasDragTests(unittest.TestCase):
+    def setUp(self) -> None:
+        cls = APP.Canvas
+
+        def monitor(name: str, x: int) -> "APP.Monitor":
+            mode = APP.Mode(1920, 1080, 60.0)
+            return APP.Monitor(name=name, description="", modes=[mode], mode=mode,
+                               scale=1.0, transform=0, x=x, y=0, enabled=True, index=1)
+
+        class App:
+            def __init__(self) -> None:
+                self.monitors = [monitor("eDP-1", 0), monitor("DP-1", 1920)]
+
+            def select(self, _mon) -> None:
+                pass
+
+            def on_geometry_changed(self, redraw_only: bool = False) -> None:
+                pass
+
+        class FakeCanvas:
+            _fit = cls.__dict__["_fit"]
+            _view = cls.__dict__["_view"]
+            _snap = cls.__dict__["_snap"]
+            to_desktop = cls.__dict__["to_desktop"]
+            monitor_at = cls.__dict__["monitor_at"]
+            _drag_begin = cls.__dict__["_drag_begin"]
+            _drag_update = cls.__dict__["_drag_update"]
+            _drag_end = cls.__dict__["_drag_end"]
+
+            def __init__(self) -> None:
+                self.app = App()
+                self.zoom = 1.0
+                self.offset = (0.0, 0.0)
+                self.drag_target = None
+                self.drag_origin = (0, 0)
+                self.drag_view = (1.0, (0.0, 0.0))
+                self.guides = []
+
+            def get_width(self) -> int:
+                return 800
+
+            def get_height(self) -> int:
+                return 500
+
+            def set_cursor(self, _cursor) -> None:
+                pass
+
+        self.canvas = FakeCanvas()
+        self.canvas._view(800, 500)
+
+    def test_drag_keeps_projection_and_follows_pointer(self) -> None:
+        canvas = self.canvas
+        zoom, offset = canvas.zoom, canvas.offset
+        start = zoom * 1920 + offset[0] + 10
+        canvas._drag_begin(None, start, 250)
+        dragged = canvas.drag_target
+        self.assertEqual(dragged.name, "DP-1")
+        for step in (30, 150, 450):
+            canvas._drag_update(None, step, 0)
+            canvas._view(800, 500)  # what every repaint does
+            self.assertEqual((canvas.zoom, canvas.offset), (zoom, offset))
+        self.assertAlmostEqual(dragged.x, 1920 + 450 / zoom, delta=1)
+
+    def test_drag_end_refits_after_normalize(self) -> None:
+        canvas = self.canvas
+        zoom = canvas.zoom
+        canvas._drag_begin(None, zoom * 1920 + canvas.offset[0] + 10, 250)
+        canvas._drag_update(None, 450, 0)
+        canvas._drag_end(None, 450, 0)
+        self.assertIsNone(canvas.drag_target)
+        self.assertLess(canvas.zoom, zoom)
+
 
 class PublicationPrivacyTests(unittest.TestCase):
     def test_tracked_release_files_do_not_contain_original_home_path(self) -> None:
