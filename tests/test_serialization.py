@@ -254,16 +254,20 @@ class SaveLuaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, "hypr", "monitors.lua")
-        self.saved = (APP.MONITORS_LUA, APP.hyprctl, APP.apply_monitors)
+        self.saved = (APP.MONITORS_LUA, APP.hyprctl, APP.apply_monitors,
+                      APP.hyprctl_eval)
         APP.MONITORS_LUA = self.path
         self.errors_before = "no errors"
         self.errors_after = "no errors"
         self.apply_result = (True, "ok")
+        self.eval_result = (True, "ok")
         self.reloaded = False
+        self.calls = []
 
         def fake_hyprctl(*args):
             if args == ("reload",):
                 self.reloaded = True
+                self.calls.append("reload")
                 return "ok"
             if args == ("configerrors",):
                 return self.errors_after if self.reloaded else self.errors_before
@@ -271,13 +275,20 @@ class SaveLuaTests(unittest.TestCase):
 
         APP.hyprctl = fake_hyprctl
         APP.apply_monitors = lambda _m: self.apply_result
+
+        def fake_eval(chunk):
+            self.calls.append(("eval", chunk))
+            return self.eval_result
+
+        APP.hyprctl_eval = fake_eval
         mode = APP.Mode(1920, 1080, 60.0)
         self.monitors = [APP.Monitor(name="DP-1", description="", modes=[mode],
                                      mode=mode, scale=1.0, transform=0, x=0, y=0,
                                      enabled=True, index=1)]
 
     def tearDown(self) -> None:
-        APP.MONITORS_LUA, APP.hyprctl, APP.apply_monitors = self.saved
+        (APP.MONITORS_LUA, APP.hyprctl, APP.apply_monitors,
+         APP.hyprctl_eval) = self.saved
         self.tmp.cleanup()
 
     def write_original(self, text: str = "-- mine\n") -> None:
@@ -313,6 +324,42 @@ class SaveLuaTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("nope", message)
         self.assertEqual(self.read(), "-- mine\n")
+
+    def previous_block(self) -> tuple[str, list[str]]:
+        mode = APP.Mode(2560, 1440, 60.0)
+        old = [APP.Monitor(name="DP-1", description="Old desk", modes=[mode],
+                           mode=mode, scale=1.0, transform=0, x=1920, y=0,
+                           enabled=True, index=1)]
+        text = "-- mine\n\n" + APP.render_block(old) + "\n"
+        return text, [m.lua() for m in old]
+
+    def test_failed_save_reapplies_restored_geometry_after_reload(self) -> None:
+        text, lines = self.previous_block()
+        self.write_original(text)
+        self.errors_after = "monitors.lua:4: bad"
+        ok, message = APP.save_lua(self.monitors)
+        self.assertFalse(ok)
+        self.assertEqual(self.read(), text)
+        self.assertIn("restored from monitors.lua.bak.", message)
+        self.assertNotIn("re-apply", message)
+        self.assertEqual(self.calls[-2:], ["reload", ("eval", "\n".join(lines))])
+
+    def test_failed_reapply_of_restored_geometry_is_in_banner(self) -> None:
+        text, _lines = self.previous_block()
+        self.write_original(text)
+        self.errors_after = "monitors.lua:4: bad"
+        self.eval_result = (False, "output gone")
+        ok, message = APP.save_lua(self.monitors)
+        self.assertFalse(ok)
+        self.assertIn("monitors.lua:4: bad", message)
+        self.assertIn("restored from monitors.lua.bak.", message)
+        self.assertIn("could not re-apply its layout: output gone", message)
+
+    def test_restored_file_without_block_reapplies_nothing(self) -> None:
+        self.write_original()
+        self.errors_after = "monitors.lua:4: bad"
+        APP.save_lua(self.monitors)
+        self.assertFalse([c for c in self.calls if isinstance(c, tuple) and c[1]])
 
     def test_failed_first_save_removes_new_file(self) -> None:
         self.errors_after = "monitors.lua:2: bad"

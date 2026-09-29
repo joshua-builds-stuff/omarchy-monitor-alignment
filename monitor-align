@@ -1185,21 +1185,39 @@ def write_atomic(path: str, text: str) -> None:
         raise
 
 
+def block_monitor_lines(text: str) -> list[str]:
+    """The hl.monitor lines of a generated block, or [] when there is none."""
+    if BLOCK_BEGIN not in text or BLOCK_END not in text:
+        return []
+    _, _, rest = text.partition(BLOCK_BEGIN)
+    block, _, _ = rest.partition(BLOCK_END)
+    return [line.strip() for line in block.splitlines()
+            if line.strip().startswith("hl.monitor(")]
+
+
 def restore_backup(backup: str) -> str:
     """Put the pre-save monitors.lua back after a failed save; describe it."""
+    previous = ""
     try:
         if backup:
             with open(backup, "r") as handle:
-                write_atomic(MONITORS_LUA, handle.read())
+                previous = handle.read()
+            write_atomic(MONITORS_LUA, previous)
         else:
             os.unlink(MONITORS_LUA)
     except OSError as exc:
         where = f"; restore it from {os.path.basename(backup)}" if backup else ""
         return f" — could not roll back monitors.lua ({exc}){where}"
     hyprctl("reload")
-    if backup:
-        return f" — monitors.lua restored from {os.path.basename(backup)}"
-    return " — new monitors.lua removed"
+    if not backup:
+        return " — new monitors.lua removed"
+    note = f" — monitors.lua restored from {os.path.basename(backup)}"
+    # Same reason as the save path: reload alone can leave the catch-all
+    # auto layout up, so re-assert the restored file's explicit geometry.
+    ok, message = hyprctl_eval("\n".join(block_monitor_lines(previous)))
+    if not ok:
+        note += f"; could not re-apply its layout: {message[:160]}"
+    return note
 
 
 # --------------------------------------------------------------------------
