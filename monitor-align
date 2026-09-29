@@ -411,7 +411,7 @@ def normalize(monitors: list[Monitor]) -> None:
         return
     dx = min(m.x for m in active)
     dy = min(m.y for m in active)
-    for mon in active:
+    for mon in monitors:
         mon.x -= dx
         mon.y -= dy
 
