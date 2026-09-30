@@ -132,12 +132,15 @@ class Palette:
 
 
 def hyprctl_json(args: list[str]):
+    """Parsed JSON from `hyprctl -j`, or None when the read failed."""
     try:
         out = subprocess.run(["hyprctl", "-j"] + args, capture_output=True,
                              text=True, timeout=5)
+        if out.returncode != 0:
+            return None
         return json.loads(out.stdout)
     except Exception:
-        return []
+        return None
 
 
 def hyprctl_eval(chunk: str) -> tuple[bool, str]:
@@ -162,6 +165,8 @@ def hyprctl_eval(chunk: str) -> tuple[bool, str]:
 
 def apply_monitors(monitors: list[Monitor]) -> tuple[bool, str]:
     """Push the whole arrangement to Hyprland in one chunk."""
+    if not monitors:
+        return False, "no monitors to apply"
     return hyprctl_eval("\n".join(m.lua() for m in monitors))
 
 
@@ -352,9 +357,13 @@ def pick_mode(modes: list[Mode], w: int, h: int, rate: float) -> Mode:
     return min(candidates, key=lambda m: abs(m.rate - rate))
 
 
-def load_monitors() -> list[Monitor]:
+def load_monitors() -> list[Monitor] | None:
+    """The desk as hyprctl reports it, or None when hyprctl could not be read."""
+    entries = hyprctl_json(["monitors", "all"])
+    if not isinstance(entries, list):
+        return None
     monitors: list[Monitor] = []
-    for entry in hyprctl_json(["monitors", "all"]):
+    for entry in entries:
         modes = [m for m in (parse_mode(s) for s in entry.get("availableModes", [])) if m]
         modes.sort(key=lambda m: (-m.w * m.h, -m.rate))
         width = int(entry.get("width") or 0)
@@ -1123,7 +1132,10 @@ def render_block(monitors: list[Monitor]) -> str:
     return "\n".join(lines)
 
 
-def save_lua(monitors: list[Monitor]) -> tuple[bool, str]:
+def save_lua(monitors: list[Monitor], allow_empty: bool = False) -> tuple[bool, str]:
+    # An empty block drops every hl.monitor rule; only write one on request.
+    if not monitors and not allow_empty:
+        return False, "Refusing to save: no monitors loaded, monitors.lua left unchanged"
     try:
         with open(MONITORS_LUA, "r") as handle:
             original = handle.read()
@@ -1291,6 +1303,7 @@ class MonitorAlign(Adw.ApplicationWindow):
         self.identify = IdentifyOverlay(self.pal, on_hidden=self._identify_hidden)
         self._loading = False
         self._saving = False
+        self.load_failed = False
         self._pending: dict | None = None  # the open Keep/Revert prompt
 
         provider = Gtk.CssProvider()
@@ -1507,7 +1520,16 @@ class MonitorAlign(Adw.ApplicationWindow):
     # -- state -----------------------------------------------------------
 
     def reload(self, reset_baseline: bool = False) -> None:
-        self.monitors = load_monitors()
+        monitors = load_monitors()
+        self.load_failed = monitors is None
+        if monitors is None:
+            # Keep whatever model we had; Try it and Save stay refused until a
+            # reload succeeds.
+            if self.monitors:
+                self._warn("Could not read monitors from hyprctl — is Hyprland running?")
+                return
+            monitors = []
+        self.monitors = monitors
         if not self.monitors:
             self._warn("No monitors reported by hyprctl — is Hyprland running?")
         self.applied = [m.lua() for m in self.monitors]
@@ -1518,6 +1540,8 @@ class MonitorAlign(Adw.ApplicationWindow):
         self._rebuild_selector()
         self._sync_identify(restructure=True)
         self.on_geometry_changed()
+        if self.load_failed:
+            self._warn("Could not read monitors from hyprctl — is Hyprland running?")
 
     def _rebuild_selector(self) -> None:
         child = self.selector.get_first_child()
@@ -1771,7 +1795,19 @@ class MonitorAlign(Adw.ApplicationWindow):
         else:
             self.identify.rebind(self.monitors)
 
+    def _refuse_write(self) -> bool:
+        """Warn and return True when there is no trustworthy model to push."""
+        if self.load_failed:
+            self._warn("Could not read monitors from hyprctl — reload before applying or saving")
+            return True
+        if not self.monitors:
+            self._warn("No monitors loaded — nothing to apply or save")
+            return True
+        return False
+
     def _on_apply(self, *_a) -> None:
+        if self._refuse_write():
+            return
         ok, message = apply_monitors(self.monitors)
         if not ok:
             self._warn(f"Could not apply: {message[:160]}")
@@ -1863,6 +1899,8 @@ class MonitorAlign(Adw.ApplicationWindow):
             self._saving = False
 
     def _save(self) -> None:
+        if self._refuse_write():
+            return
         ok, message = apply_monitors(self.monitors)
         if not ok:
             self._warn(f"Could not apply: {message[:160]}")
@@ -1904,7 +1942,7 @@ def run_identify_only(seconds: int) -> int:
 
     def activate(_a) -> None:
         overlay = IdentifyOverlay(Palette())
-        overlay.show(load_monitors(), seconds)
+        overlay.show(load_monitors() or [], seconds)
         if not overlay.visible:
             app.quit()
             return
