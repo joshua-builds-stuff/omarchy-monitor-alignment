@@ -416,6 +416,11 @@ def normalize(monitors: list[Monitor]) -> None:
         mon.y -= dy
 
 
+def drag_moved(origin: tuple[int, int], position: tuple[int, int]) -> bool:
+    """Whether a finished canvas gesture moved its tile; a plain click does not."""
+    return tuple(position) != tuple(origin)
+
+
 def order_along(monitors: list[Monitor], axis: str) -> list[Monitor]:
     """Enabled monitors in their current visual order along an axis."""
     active = active_of(monitors)
@@ -935,11 +940,16 @@ class Canvas(Gtk.DrawingArea):
         self.app.on_geometry_changed(redraw_only=True)
 
     def _drag_end(self, _g, dx, dy) -> None:
-        if self.drag_target is None:
+        mon = self.drag_target
+        if mon is None:
             return
+        if dx or dy or drag_moved(self.drag_origin, (mon.x, mon.y)):
+            self._drag_update(_g, dx, dy)
         self.drag_target = None
         self.guides = []
-        normalize(self.app.monitors)
+        # A click only selects; keep origins typed into Position X/Y.
+        if drag_moved(self.drag_origin, (mon.x, mon.y)):
+            normalize(self.app.monitors)
         self._fit(self.get_width(), self.get_height())
         self.set_cursor(Gdk.Cursor.new_from_name("grab", None))
         self.app.on_geometry_changed()
