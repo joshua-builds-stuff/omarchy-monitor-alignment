@@ -1136,7 +1136,7 @@ def save_lua(monitors: list[Monitor]) -> tuple[bool, str]:
     backup = ""
     try:
         if os.path.exists(MONITORS_LUA):
-            backup = f"{MONITORS_LUA}.bak.{int(time.time())}"
+            backup = unused_backup_path()
             shutil.copy2(MONITORS_LUA, backup)
         os.makedirs(os.path.dirname(MONITORS_LUA), exist_ok=True)
         write_atomic(MONITORS_LUA, new)
@@ -1157,6 +1157,17 @@ def save_lua(monitors: list[Monitor]) -> tuple[bool, str]:
         return False, problem + restore_backup(backup)
     note = f" (backup: {os.path.basename(backup)})" if backup else ""
     return True, f"Saved to monitors.lua{note}"
+
+
+def unused_backup_path() -> str:
+    """A backup name no earlier save has taken, so none is ever overwritten."""
+    stamp = time.time_ns()
+    backup = f"{MONITORS_LUA}.bak.{stamp}"
+    count = 0
+    while os.path.exists(backup):
+        count += 1
+        backup = f"{MONITORS_LUA}.bak.{stamp}.{count}"
+    return backup
 
 
 def config_errors() -> set[str]:
@@ -1266,6 +1277,7 @@ class MonitorAlign(Adw.ApplicationWindow):
         self.applied: list[str] = []    # what the compositor is showing now
         self.identify = IdentifyOverlay(self.pal, on_hidden=self._identify_hidden)
         self._loading = False
+        self._saving = False
         self._pending: dict | None = None  # the open Keep/Revert prompt
 
         provider = Gtk.CssProvider()
@@ -1829,6 +1841,15 @@ class MonitorAlign(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_save(self, *_a) -> None:
+        if self._saving:
+            return
+        self._saving = True
+        try:
+            self._save()
+        finally:
+            self._saving = False
+
+    def _save(self) -> None:
         ok, message = apply_monitors(self.monitors)
         if not ok:
             self._warn(f"Could not apply: {message[:160]}")

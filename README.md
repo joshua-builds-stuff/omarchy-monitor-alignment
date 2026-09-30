@@ -50,7 +50,7 @@ In the window:
 3. Select **Try it** to apply the arrangement live. One **Keep this arrangement?** dialog counts down from 15 seconds. **Keep** retains the arrangement that was just applied. **Revert**, closing the dialog, or the end of the countdown returns to the last kept arrangement. If that apply fails, the banner shows `Could not revert:` and the window does not reload or toast `Reverted`. A newer **Try it** replaces that dialog and cancels its timer, so only the newest countdown can revert. Try it does not write `monitors.lua`.
 4. Select **Save** to apply the arrangement and write the generated block to `~/.config/hypr/monitors.lua`. The new text is written to a temporary file and renamed into place. Config errors Hyprland already reported are ignored. After `hyprctl reload`, if the following re-apply fails, or Hyprland reports a new config error, the previous file is restored and, when it has a generated block, its `hl.monitor` lines are applied again. If that restored-layout apply fails, the banner adds `could not re-apply its layout:`. A file this save created is removed instead.
 
-The save operation preserves content outside the marked `monitor-align` block. If `monitors.lua` already exists, the app first makes a timestamped backup beside it, named `monitors.lua.bak.<timestamp>`.
+The save operation preserves content outside the marked `monitor-align` block. If `monitors.lua` already exists, the app first makes a timestamped backup beside it, named `monitors.lua.bak.<timestamp>`. Existing backups are never overwritten.
 
 To show the identification overlay without opening the editor:
 
