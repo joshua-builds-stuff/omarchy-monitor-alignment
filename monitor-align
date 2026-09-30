@@ -1123,12 +1123,15 @@ def save_lua(monitors: list[Monitor]) -> tuple[bool, str]:
         return False, str(exc)
 
     if BLOCK_BEGIN in original and BLOCK_END in original:
+        # Replace the block in place so lines after it stay after it.
         head, _, rest = original.partition(BLOCK_BEGIN)
         _, _, tail = rest.partition(BLOCK_END)
-        original = head.rstrip("\n") + "\n" + tail.lstrip("\n")
-
-    body = original.rstrip("\n")
-    new = (body + "\n\n" if body else "") + render_block(monitors) + "\n"
+        new = head + render_block(monitors) + tail
+        if not new.endswith("\n"):
+            new += "\n"
+    else:
+        body = original.rstrip("\n")
+        new = (body + "\n\n" if body else "") + render_block(monitors) + "\n"
 
     # Errors Hyprland already had are not ours to fail on.
     before = config_errors()
