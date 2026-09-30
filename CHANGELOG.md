@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 The application version remains **1.0.0**. The dated entries below are minor revisions of behavior already shipped on `main`.
 
+## 2026-09-30 (minor)
+
+- Refused **Try it** and **Save** after `hyprctl -j monitors all` fails (timeout, non-zero exit, or a result that is not a JSON list) or returns no monitors. Neither button applies an arrangement or writes `monitors.lua`. A failed reload that already had displays leaves them on the canvas. The banner is `Could not read monitors from hyprctl — reload before applying or saving` after a failed read, and `No monitors loaded — nothing to apply or save` when the desk is empty (#25).
+- A click on a canvas tile selects that display and leaves **Position X** and **Position Y** unchanged, including an origin other than `0,0`. A drag that moves the tile still shifts the enabled group's top-left to `0,0` (#26).
+- Save replaces the generated block in place when `monitors.lua` contains both markers, so lines after `-- <<< monitor-align` stay after the rewritten block. When the file has other text and lacks either marker, that text is kept and the block is appended after a blank line (#27).
+- Backup names use a nanosecond stamp, `monitors.lua.bak.<timestamp>`, and `.1`, `.2`, … when that name already exists, so an earlier backup is never overwritten. A **Save** that starts while another save is still running is ignored (#28).
+
 ## 2026-09-29 (minor)
 
 - Shifted every display, including disabled ones, when moving the enabled group's top-left to `0,0`, so a disabled panel keeps its relative position (#16).

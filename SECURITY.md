@@ -8,6 +8,10 @@ Security fixes are provided for the latest tagged release.
 | --- | --- |
 | 1.x | Yes |
 
+## Configuration writes
+
+A failed read of `hyprctl -j monitors all`, and a successful read that returns no monitors, do not apply an arrangement and do not rewrite `~/.config/hypr/monitors.lua`. Save does not replace the generated block when no monitors are loaded, so existing `hl.monitor` rules stay in the file. A second Save that starts while a save is still running is ignored. Each backup of an existing `monitors.lua` is copied to a new `monitors.lua.bak.<timestamp>` name, and an earlier backup is left in place.
+
 ## Reporting a vulnerability
 
 Please use GitHub's private security advisory feature for this repository. Do not include passwords, access tokens, private configuration files, or other sensitive personal data in a public issue.

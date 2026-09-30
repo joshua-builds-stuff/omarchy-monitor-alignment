@@ -16,7 +16,11 @@ The session must be Wayland, and `hyprctl` must be on `PATH`. Otherwise the prog
 
 The header has **Identify**, a reload button (the refresh icon; tooltip “Reload the live configuration, discarding changes”), **Try it**, and **Save**. The sidebar has **Arrangement**, the selected **Display**, and a **Preview** of the Lua block that Save would write.
 
-Reload discards unapplied edits and reads the desk again. It is the refresh icon, not **Revert** on the Try it dialog.
+The refresh button reads the desk again with `hyprctl -j monitors all`. It is not **Revert** on the Try it dialog. When that read succeeds, unapplied edits are discarded and the window shows the desk `hyprctl` reported. When the read fails and the window already has displays, those displays and their edits stay, and the banner shows `Could not read monitors from hyprctl — is Hyprland running?`.
+
+A read that times out, exits non-zero, or does not return a JSON list is a failed load. **Try it** and **Save** stay refused until a later reload succeeds. The banner on that reload is `Could not read monitors from hyprctl — is Hyprland running?`. When the window had no displays yet, the model stays empty.
+
+A read that returns an empty JSON list is an empty desk: the window has no displays, and the geometry check that follows a successful load clears the banner when there is nothing to report. **Try it** and **Save** stay refused until a reload returns at least one monitor. Those buttons warn `No monitors loaded — nothing to apply or save`.
 
 ## Scale
 
@@ -32,15 +36,17 @@ The **Scale** combo is built from the targets 1, 1.25, 1.3333, 1.5, 1.6, 1.75, 2
 
 Drag a display on the canvas. Edges and centres snap to neighbouring displays. The hint under the canvas describes that snap.
 
-The canvas records its zoom and offset when the drag starts. While the drag continues, repaints keep that projection, and the pointer's movement is divided by that zoom, so the display stays under the pointer. When the drag ends, the canvas refits to the desktop.
+The canvas records its zoom and offset when the drag starts. While the drag continues, repaints keep that projection, and the pointer's movement is divided by that zoom, so the display stays under the pointer. When the gesture ends, the canvas refits to the desktop.
 
-**Position X** and **Position Y**, on the selected display, accept whole pixels from -20000 to 20000. Editing either of them updates the canvas immediately and leaves the other displays where they are.
+A click that does not move the tile selects that display and leaves every position as it was. **Position X** and **Position Y** keep the origin you typed, including a value other than `0,0`. Releasing a drag whose offset moved the tile applies that move, then shifts the desktop so the enabled group's top-left sits at `0,0`.
+
+**Position X** and **Position Y**, on the selected display, accept whole pixels from -20000 to 20000. Editing either of them updates the canvas immediately and leaves the other displays where they are. Typing a position does not run the shift to `0,0`.
 
 **Arrange**, under **Arrangement**, packs enabled displays edge to edge in their current order. **Direction** is `Row — left to right` or `Column — top to bottom`. **Align on** is `Top edges`, `Centers`, or `Bottom edges` in a row, and `Left edges`, `Centers`, or `Right edges` in a column. **Landscape** and **Portrait** under **Rotate every display** set every enabled display, then pack them the same way.
 
 **Order**, on the selected display, moves that display earlier or later in the current order (tooltips: “Move earlier (left, or up)” and “Move later (right, or down)”), then packs again. The **Enabled** switch turns the selected display on or off. Turning off the last enabled display is rejected with the toast `At least one display has to stay on`.
 
-After a drag ends, and after an accepted **Enabled** change, Arrange, Order, scale, orientation, or resolution, the desktop is shifted so the top-left of the enabled displays sits at `0,0`. Every display is shifted by that same amount, including disabled ones, so a disabled panel keeps its position relative to the enabled group. A disabled display that sat to the left or above that group can end at a negative origin.
+After a drag that moved its tile, and after an accepted **Enabled** change, Arrange, Order, scale, orientation, or resolution, the desktop is shifted so the top-left of the enabled displays sits at `0,0`. Every display is shifted by that same amount, including disabled ones, so a disabled panel keeps its position relative to the enabled group. A disabled display that sat to the left or above that group can end at a negative origin. A click on a tile does not run this shift.
 
 ## Identify
 
@@ -72,7 +78,11 @@ monitor-align --version
 
 ## Try it
 
-**Try it** pushes the current arrangement to Hyprland immediately (tooltip: “Apply live with a 15 second auto-revert”). If that apply fails, the banner reports `Could not apply:` and no confirmation dialog opens.
+**Try it** pushes the current arrangement to Hyprland immediately (tooltip: “Apply live with a 15 second auto-revert”).
+
+**Try it** does not call `hyprctl` when the last load failed or the window has no monitors. After a failed load the banner is `Could not read monitors from hyprctl — reload before applying or saving`. With an empty desk it is `No monitors loaded — nothing to apply or save`. No confirmation dialog opens. Use the refresh button to read the desk again.
+
+When monitors are loaded and the apply fails, the banner reports `Could not apply:` and no confirmation dialog opens.
 
 When the apply succeeds, one dialog is shown:
 
@@ -91,10 +101,12 @@ Only one of these dialogs is pending. A second **Try it** closes the first dialo
 
 **Save** applies the arrangement and writes `~/.config/hypr/monitors.lua` (tooltip: “Apply and write to ~/.config/hypr/monitors.lua”). Review the **Preview** group first. That text is the block that will be written.
 
+**Save** uses the same refusal as **Try it**. After a failed load the banner is `Could not read monitors from hyprctl — reload before applying or saving`. With an empty desk it is `No monitors loaded — nothing to apply or save`. In both cases the arrangement is not applied and `monitors.lua` is left unchanged, so an empty generated block is not written over existing `hl.monitor` rules. Selecting **Save** again while a save is still running is ignored: that click does not apply the arrangement, write the file, or make another backup.
+
 1. The arrangement is applied live. If that fails, the banner reports `Could not apply:` and the file is left untouched.
-2. The existing `monitors.lua` is read. A missing file is treated as empty. Text outside the marked block is preserved. The block starts with `-- >>> monitor-align: generated block, edits here are overwritten` and ends with `-- <<< monitor-align`.
+2. The existing `monitors.lua` is read. A missing file is treated as empty. The block starts with `-- >>> monitor-align: generated block, edits here are overwritten` and ends with `-- <<< monitor-align`. When the file contains both markers, the block is replaced where it stands: text before the begin marker stays before the new block, and text after the end marker stays after it. When the file has other text and lacks either marker, that text is kept and the block is appended after a blank line.
 3. Config errors already reported by `hyprctl configerrors` are recorded. Those existing errors do not fail the save.
-4. If the file already exists, it is copied to `monitors.lua.bak.<timestamp>` beside it. `<timestamp>` is the Unix time in nanoseconds; if that name is already taken, `.1`, `.2`, … is appended so an earlier backup is never overwritten. Backups are not pruned.
+4. If the file already exists, it is copied to `monitors.lua.bak.<timestamp>` beside it. `<timestamp>` is the Unix time in nanoseconds. If that path already exists, the name gains a `.1`, `.2`, … suffix (`monitors.lua.bak.<timestamp>.1`) until it is free, so an earlier backup is never overwritten. Backups are not pruned.
 5. The new file is written to a temporary file in the same directory, flushed, and renamed over `monitors.lua`. A failed write leaves the existing file in place and removes the temporary file. When a backup was made, the banner includes `original kept` and the backup name.
 6. The app runs `hyprctl reload`, then applies the same explicit geometry again so a catch-all `position = "auto"` rule cannot leave the desk shuffled.
 7. If that re-apply fails, or `hyprctl configerrors` reports an error that was not in the set from step 3, the save fails. The previous file contents are written back by the same rename, or the new `monitors.lua` is removed when this save created it, and `hyprctl reload` runs again. When a backup was restored, the `hl.monitor` lines from its generated block are then applied again, the same way step 6 re-asserts the new block; if that re-apply fails, the banner adds `could not re-apply its layout:` and the error. A restored file with no generated block, and a file this save created, have no such lines, so only the reload runs. The banner includes the failure and either `monitors.lua restored from monitors.lua.bak.<timestamp>` or `new monitors.lua removed`. If that restore fails, the banner says `could not roll back monitors.lua` and, when a backup exists, names that backup.
