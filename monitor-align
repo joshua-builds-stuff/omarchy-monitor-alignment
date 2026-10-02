@@ -23,7 +23,7 @@ import sys
 import time
 import tomllib
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cairo
 import gi
@@ -184,6 +184,8 @@ def hyprctl(*args: str) -> str:
 # Model
 # --------------------------------------------------------------------------
 
+EDITED_KEYS = {"output", "mode", "position", "scale", "transform", "disabled", "mirror"}
+
 
 def lua_string(value: str) -> str:
     """Return a Lua double-quoted string containing exactly ``value``.
@@ -300,6 +302,10 @@ class Monitor:
     y: int
     enabled: bool
     index: int = 0
+    mirror: str = ""
+    # Keys of this output's existing hl.monitor rule that the editor does not
+    # edit (bitdepth, cm, vrr, ...), as raw Lua values, written back verbatim.
+    extra: dict[str, str] = field(default_factory=dict)
 
     @property
     def rotated(self) -> bool:
@@ -353,7 +359,16 @@ class Monitor:
                 f'mode = "{self.mode.hypr}", '
                 f'position = "{self.x}x{self.y}", '
                 f'scale = {format_scale(self.scale)}, '
-                f'transform = {self.transform} }})')
+                f'transform = {self.transform}{self.passthrough()} }})')
+
+    def passthrough(self) -> str:
+        """Mirror and preserved keys, each prefixed with ", "."""
+        parts = []
+        if self.mirror:
+            parts.append(f"mirror = {lua_string(self.mirror)}")
+        parts.extend(f"{key} = {value}" for key, value in self.extra.items()
+                     if key not in EDITED_KEYS)
+        return "".join(f", {part}" for part in parts)
 
 
 def pick_mode(modes: list[Mode], w: int, h: int, rate: float) -> Mode:
@@ -379,6 +394,81 @@ def saved_position(text: str, name: str) -> tuple[int, int] | None:
     return found
 
 
+def lua_table_fields(text: str, start: int) -> tuple[list[tuple[str, str]], int]:
+    """Top-level `key = value` pairs of the Lua table opening at text[start].
+
+    Values are kept as raw source. Returns the pairs and the index just past
+    the closing brace (or len(text) when the table is unterminated).
+    """
+    depth = 0
+    quote = ""
+    parts: list[str] = []
+    current: list[str] = []
+    i = start
+    while i < len(text):
+        char = text[i]
+        if quote:
+            current.append(char)
+            if char == "\\" and i + 1 < len(text):
+                current.append(text[i + 1])
+                i += 1
+            elif char == quote:
+                quote = ""
+        elif char in ("'", '"'):
+            quote = char
+            current.append(char)
+        elif text.startswith("--", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        elif char in "{([":
+            depth += 1
+            if depth > 1:
+                current.append(char)
+        elif char in "})]":
+            depth -= 1
+            if depth == 0:
+                parts.append("".join(current))
+                i += 1
+                break
+            current.append(char)
+        elif char in ",;" and depth == 1:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        i += 1
+    pairs = []
+    for part in parts:
+        key, eq, value = part.partition("=")
+        key, value = key.strip(), value.strip()
+        if eq and key.isidentifier() and value:
+            pairs.append((key, value))
+    return pairs, i
+
+
+def existing_rule_keys(text: str, name: str) -> dict[str, str]:
+    """Keys of the last hl.monitor rule for `name` in `text`, as raw Lua values."""
+    found: dict[str, str] = {}
+    pos = 0
+    while True:
+        at = text.find("hl.monitor(", pos)
+        if at < 0:
+            return found
+        line_start = text.rfind("\n", 0, at) + 1
+        brace = text.find("{", at)
+        if "--" in text[line_start:at] or brace < 0:
+            pos = at + 1
+            continue
+        pairs, pos = lua_table_fields(text, brace)
+        rule = dict(pairs)
+        output = rule.get("output", "")
+        if output == lua_string(name) or (
+                len(output) >= 2 and output[0] == output[-1] and output[0] in "'\""
+                and "\\" not in output and output[1:-1] == name):
+            found = rule
+
+
 def read_monitors_lua() -> str:
     try:
         with open(MONITORS_LUA, "r") as handle:
@@ -392,7 +482,7 @@ def load_monitors() -> list[Monitor] | None:
     entries = hyprctl_json(["monitors", "all"])
     if not isinstance(entries, list):
         return None
-    saved_text: str | None = None
+    saved_text = read_monitors_lua()
     monitors: list[Monitor] = []
     for entry in entries:
         modes = [m for m in (parse_mode(s) for s in entry.get("availableModes", [])) if m]
@@ -415,9 +505,11 @@ def load_monitors() -> list[Monitor] | None:
         y = int(entry.get("y") or 0)
         if not enabled and x == 0 and y == 0:
             # A disabled output reports 0x0; its saved rule knows where it sat.
-            if saved_text is None:
-                saved_text = read_monitors_lua()
             x, y = saved_position(saved_text, name) or (x, y)
+        mirror = str(entry.get("mirrorOf") or "none")
+        extra = {key: value
+                 for key, value in existing_rule_keys(saved_text, name).items()
+                 if key not in EDITED_KEYS}
         monitors.append(Monitor(
             name=name,
             description=entry.get("description", ""),
@@ -428,6 +520,8 @@ def load_monitors() -> list[Monitor] | None:
             x=x,
             y=y,
             enabled=enabled,
+            mirror="" if mirror == "none" else mirror,
+            extra=extra,
         ))
     # Number them left to right, top to bottom, so the badges the identify
     # overlay paints on the real screens read 1, 2, 3 across the desk.
