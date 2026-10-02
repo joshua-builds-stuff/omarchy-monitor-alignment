@@ -1876,6 +1876,9 @@ class MonitorAlign(Adw.ApplicationWindow):
                 GLib.source_remove(state["source"])
                 state["source"] = 0
             if response == "keep":
+                if state.get("rolled_back"):
+                    self._warn("The tried layout is no longer on screen — not kept")
+                    return
                 self.baseline = state["keep"]
                 self._toast("Applied. Save to keep it across restarts.")
             else:
@@ -1914,9 +1917,18 @@ class MonitorAlign(Adw.ApplicationWindow):
             self._sync_identify(restructure=True)
             self._toast(message)
         else:
+            # The failed save restored the previous layout, so the Try it
+            # snapshot is no longer on screen and Keep must not adopt it.
+            if self._pending is not None:
+                self._pending["rolled_back"] = True
+            self._dismiss_pending()
+            live = load_monitors()
+            self.applied = [m.lua() for m in live] if live else []
+            self._sync_identify(restructure=True)
             self._warn(message)
 
     def _on_close(self, *_a) -> bool:
+        self._dismiss_pending()
         self.identify.hide()
         return False
 
