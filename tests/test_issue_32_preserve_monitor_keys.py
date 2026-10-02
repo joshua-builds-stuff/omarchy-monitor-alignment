@@ -81,6 +81,22 @@ class LuaPassthroughTests(unittest.TestCase):
         self.assertNotIn("mirror", line)
         self.assertTrue(line.endswith("transform = 0 })"))
 
+    def test_disabled_lua_keeps_extra_keys_and_mirror(self) -> None:
+        # After #31+#32 merge: disabled rules keep geometry AND mirror/extra.
+        line = monitor(name="HDMI-A-1", enabled=False, mirror="DP-1",
+                       extra={"vrr": "1", "bitdepth": "10"}).lua()
+        self.assertIn('output = "HDMI-A-1"', line)
+        self.assertIn("disabled = true", line)
+        self.assertIn('position = "', line)
+        self.assertIn('mirror = "DP-1"', line)
+        self.assertIn("vrr = 1", line)
+        self.assertIn("bitdepth = 10", line)
+        self.assertTrue(line.endswith(" })"))
+        plain = monitor(enabled=False).lua()
+        self.assertIn('output = "DP-1"', plain)
+        self.assertIn("disabled = true", plain)
+        self.assertNotIn("mirror", plain)
+
     def test_existing_monitor_call_sites_default_empty(self) -> None:
         mon = monitor()
         self.assertEqual(mon.mirror, "")

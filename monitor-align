@@ -349,12 +349,13 @@ class Monitor:
         if not self.enabled:
             # Keep the geometry so the display returns where it was when it
             # is enabled again, and a reload can recover its position.
+            # Also keep mirror / unedited keys (#32) via passthrough().
             return (f"hl.monitor({{ output = {lua_string(self.name)}, "
                     f'mode = "{self.mode.hypr}", '
                     f'position = "{self.x}x{self.y}", '
                     f'scale = {format_scale(self.scale)}, '
                     f'transform = {self.transform}, '
-                    f'disabled = true }})')
+                    f'disabled = true{self.passthrough()} }})')
         return (f"hl.monitor({{ output = {lua_string(self.name)}, "
                 f'mode = "{self.mode.hypr}", '
                 f'position = "{self.x}x{self.y}", '
