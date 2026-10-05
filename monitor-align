@@ -383,16 +383,9 @@ def pick_mode(modes: list[Mode], w: int, h: int, rate: float) -> Mode:
 
 def saved_position(text: str, name: str) -> tuple[int, int] | None:
     """The position the last hl.monitor rule for `name` in `text` sets, if any."""
-    output = f"output = {lua_string(name)}"
-    found = None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("hl.monitor(") or not (
-                output + "," in line or output + " " in line):
-            continue
-        match = re.search(r'position\s*=\s*"(-?\d+)x(-?\d+)"', line)
-        found = (int(match.group(1)), int(match.group(2))) if match else None
-    return found
+    position = existing_rule_keys(text, name).get("position", "")
+    match = re.fullmatch(r'(["\'])(-?\d+)x(-?\d+)\1', position)
+    return (int(match.group(2)), int(match.group(3))) if match else None
 
 
 def lua_table_fields(text: str, start: int) -> tuple[list[tuple[str, str]], int]:
